@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { openStore } from '../chronozarr/decoder.js';
 import { buildSyntheticStore, defaultValues, maskValue } from '../support/synthetic-store.js';
 
-const SMALL = { nTime: 12, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 4, sharded: true };
+const SMALL = { nTime: 12, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
 const SMALL_CHUNK = 32 * 32 * 2;
 /** Chunks of 128 KB decoded: big enough for the bandwidth estimator to take notice. */
-const LARGE = { nTime: 12, nBand: 4, height: 128, width: 128, chunk: 128, anchorInterval: 4, sharded: true };
+const LARGE = { nTime: 12, nBand: 4, height: 128, width: 128, chunk: 128,  sharded: true };
 const LARGE_CHUNK = 4 * 128 * 128 * 2;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -321,11 +321,11 @@ test('seek: other speculative requests are cancelled and the target timestep is 
   a.abort();
   await aWork;
   const bFirst = chunkReads(readable, mark).slice(0, 2).map((c) => c.range.offset);
-  assert.equal(bFirst.length, 2);
+  assert.equal(bFirst.length, 1);
   store.setBudgets({ speculativeBytesInitial: 1e9 });
   await b;
   assert.ok(store.peekRaw(0, 0, 0, 30), 'the target timestep is resident');
-  assert.ok(store.peekRaw(0, 0, 0, store.anchorOf(30)), 'with its anchor');
+  assert.ok(store.peekRaw(0, 0, 0, 30), 'without a second timestep dependency');
 });
 
 test('seek targets are fetched even when the allowance is empty', async () => {
@@ -336,8 +336,8 @@ test('seek targets are fetched even when the allowance is empty', async () => {
   await sleep(40);
   abort.abort();
   const result = await done;
-  assert.equal(result.fetched, 2, 'exactly the anchor and the delta of t=30');
-  assert.ok(store.peekRaw(0, 0, 0, 30) && store.peekRaw(0, 0, 0, store.anchorOf(30)));
+  assert.equal(result.fetched, 1, 'exactly the data chunk of t=30');
+  assert.ok(store.peekRaw(0, 0, 0, 30));
   assert.equal(store.stats.cache.speculativeBytes, 0, 'nothing was charged to the allowance');
 });
 
@@ -365,9 +365,9 @@ test('two chunks of one cold shard share one index read, and the second is count
 
 // ---- coarse frame ----
 
-const PYRAMID = { nTime: 8, nBand: 2, height: 96, width: 96, chunk: 32, anchorInterval: 4, sharded: true, nLevels: 3 };
+const PYRAMID = { nTime: 8, nBand: 2, height: 96, width: 96, chunk: 32,  sharded: true, nLevels: 3 };
 
-test('getCoarseFrame loads the anchor and delta of every cell at demand priority and leaves them in the cache', async () => {
+test('getCoarseFrame loads one true-value chunk per cell at demand priority', async () => {
   const readable = buildSyntheticStore(PYRAMID);
   const store = await openStore('memory://coarse', { store: readable, workers: 0 });
   const events = [];
@@ -376,26 +376,24 @@ test('getCoarseFrame loads the anchor and delta of every cell at demand priority
   const frame = await store.getCoarseFrame(1, [[0, 0], [0, 1], [1, 0], [1, 1]], 6);
   assert.equal(frame.lod, 1);
   assert.equal(frame.t, 6);
-  assert.equal(frame.anchorT, 4);
   assert.equal(frame.cells.length, 4);
-  assert.equal(events.length, 8, 'an anchor and a delta per cell');
+  assert.equal(events.length, 4, 'one true-value chunk per cell');
   assert.ok(events.every((e) => e.background === false), 'all at demand priority');
   const values = defaultValues('uint16');
-  for (const { row, col, anchor, delta } of frame.cells) {
-    assert.equal(anchor, store.peekRaw(1, row, col, 4));
-    assert.equal(delta, store.peekRaw(1, row, col, 6));
-    assert.equal((anchor[3] + delta[3]) & 0xffff, values(6, 0, row * 32, col * 32 + 3, 1), `cell ${row},${col} pixel`);
+  for (const { row, col, data } of frame.cells) {
+    assert.equal(data, store.peekRaw(1, row, col, 6));
+    assert.equal(data[3], values(6, 0, row * 32, col * 32 + 3, 1), `cell ${row},${col} pixel`);
   }
 });
 
-test('getCoarseFrame at an anchor timestep returns no delta; under encoding "none" there never is one', async () => {
+test('getCoarseFrame returns true values at every timestep', async () => {
   const store = await openStore('memory://coarse-anchor', { store: buildSyntheticStore(PYRAMID), workers: 0 });
   const frame = await store.getCoarseFrame(2, [[0, 0]], 4);
-  assert.equal(frame.cells[0].delta, null);
-  const none = await openStore('memory://coarse-none', { store: buildSyntheticStore({ ...PYRAMID, encoding: 'none' }), workers: 0 });
+  assert.equal(frame.cells[0].data, store.peekRaw(2, 0, 0, 4));
+  const none = await openStore('memory://coarse-none', { store: buildSyntheticStore({ ...PYRAMID }), workers: 0 });
   const plain = await none.getCoarseFrame(2, [[0, 0]], 5);
-  assert.equal(plain.cells[0].delta, null);
-  assert.equal(plain.anchorT, 5);
+  assert.equal(plain.cells[0].data, none.peekRaw(2, 0, 0, 5));
+  assert.equal(plain.t, 5);
 });
 
 test('getCoarseFrame holds its chunks against eviction until it resolves, even with a tiny cache', async () => {
@@ -403,7 +401,7 @@ test('getCoarseFrame holds its chunks against eviction until it resolves, even w
   const cells = [[0, 0], [0, 1], [1, 0]];
   const frame = await store.getCoarseFrame(1, cells, 6);
   for (const [row, col] of cells) {
-    assert.ok(store.peekRaw(1, row, col, 4) && store.peekRaw(1, row, col, 6), `cell ${row},${col} resident although the budget holds 2 chunks`);
+    assert.ok(store.peekRaw(1, row, col, 6), `cell ${row},${col} resident although the budget holds 2 chunks`);
   }
   assert.equal(frame.cells.length, 3);
 });
@@ -421,12 +419,12 @@ test('getCoarseFrame rejects when its signal aborts, and on bad cells', async ()
 });
 
 test('coarse-first open: the deepest level costs a handful of requests and arrives first', async () => {
-  const readable = buildSyntheticStore({ ...PYRAMID, consolidated: true, shardBytes: true, specVersion: '0.2.0' });
+  const readable = buildSyntheticStore({ ...PYRAMID, consolidated: true, shardBytes: true, specVersion: '0.3.0' });
   const store = await openStore('memory://coarse-first', { store: readable, workers: 0 });
   const before = readable.log.length;
   const frame = await store.getCoarseFrame(2, [[0, 0]], 5);
   assert.equal(frame.cells.length, 1);
-  assert.equal(readable.log.length - before, 2 + 1, 'index + anchor + delta of one cell... shard index read once, chunks twice');
+  assert.equal(readable.log.length - before, 2, 'index + one true-value chunk');
 });
 
 test('the two tiers add up: decoded chunks plus chunks held only compressed', async () => {
@@ -444,10 +442,10 @@ test('the two tiers add up: decoded chunks plus chunks held only compressed', as
   assert.equal(info.compressedEntries, 14, 'the copies of those four gave way to 14 chunks that exist nowhere else');
   const decodedTimes = [];
   for (let t = 0; t < 60; t++) if (store.peekRaw(0, 0, 0, t)) decodedTimes.push(t);
-  assert.deepEqual(decodedTimes, [28, 29, 30, 31]);
+  assert.deepEqual(decodedTimes, [29, 30, 31, 32]);
   assert.equal(store.stats.cache.compressedEvictions, 4);
   const before = chunkReads(readable).length;
-  for (const t of [28, 29, 30, 31]) await store.getRaw(0, 0, 0, t);
+  for (const t of [29, 30, 31, 32]) await store.getRaw(0, 0, 0, t);
   assert.equal(chunkReads(readable).length, before, 'no refetch for the decoded ones');
 });
 
@@ -503,7 +501,7 @@ test('tier budgets are overrides: naming both makes their sum the cap, naming on
 
 test('joint cap: decoded plus compressed never exceeds it, and the compressed tier holds what the decoded tier leaves', async () => {
   // Synthetic chunks do not compress, so a compressed chunk costs as much as a decoded one: a cap of 10 chunks.
-  const spec = { nTime: 24, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 4, sharded: true, encoding: 'none' };
+  const spec = { nTime: 24, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const cached = (store) => {
     const decoded = [];
     for (let t = 0; t < 24; t++) if (store.peekRaw(0, 0, 0, t)) decoded.push(t);
@@ -543,7 +541,7 @@ test('joint cap: decoded plus compressed never exceeds it, and the compressed ti
 
 // ---- idle horizon and expansion ----
 
-const AXIS = { nTime: 60, nBand: 1, height: 64, width: 64, chunk: 32, anchorInterval: 4, sharded: true };
+const AXIS = { nTime: 60, nBand: 1, height: 64, width: 64, chunk: 32,  sharded: true };
 
 /** A store on a clock the test owns (the speculative allowance and the idle timer both read it), with an allowance that never limits. */
 async function openOnFakeClock(options = {}) {
@@ -560,14 +558,14 @@ function decodedTimes(store) {
   return times;
 }
 
-/** The chunks a window of timesteps lo..hi needs: each timestep and its anchor. */
+/** The chunks a window of timesteps lo..hi needs: each timestep once. */
 function windowChunks(store, lo, hi) {
   const chunks = new Set();
-  for (let t = lo; t <= hi; t++) chunks.add(t).add(store.anchorOf(t));
+  for (let t = lo; t <= hi; t++) chunks.add(t);
   return [...chunks].sort((a, b) => a - b);
 }
 
-test('idle: the window stops at the horizon, 12 timesteps either side of t and the anchors they need', async () => {
+test('idle: the window stops at the horizon, 12 timesteps either side of t', async () => {
   const { store } = await openOnFakeClock({ idleBytes: 1e12 });
   const result = await store.prefetch({ lod: 0, cells: [[0, 0]], t: 30, concurrency: 1 });
   const expected = windowChunks(store, 18, 42);
@@ -575,7 +573,7 @@ test('idle: the window stops at the horizon, 12 timesteps either side of t and t
   assert.equal(result.fetched, expected.length);
   assert.equal(result.budgetReached, false);
   assert.deepEqual(decodedTimes(store), expected, 'nothing beyond the horizon');
-  assert.equal(expected[0], 16, 'the anchor of t=18 is inside the window although it is 14 away');
+  assert.equal(expected[0], 18, 'the earliest timestep is exactly the horizon boundary');
   assert.equal(store.peekRaw(0, 0, 0, 59), undefined);
   assert.equal(store.peekRaw(0, 0, 0, 0), undefined);
 });
@@ -596,7 +594,7 @@ test('idle: at most idleBytes of speculative traffic per view, then it stops and
   assert.equal(first.budgetReached, true);
   assert.ok(first.fetched >= 3 && first.fetched <= 4, `3.5 chunks of allowance start 3 or 4 chunks (${first.fetched})`);
   assert.ok(first.fetched < first.planned);
-  assert.ok(store.peekRaw(0, 0, 0, 30) && store.peekRaw(0, 0, 0, store.anchorOf(30)), 'nearest first: t and its anchor');
+  assert.ok(store.peekRaw(0, 0, 0, 30), 'nearest first: the target timestep');
   assert.equal(store.peekRaw(0, 0, 0, 18), undefined);
 
   time.now += 60_000;
@@ -649,7 +647,7 @@ test('seek does not widen the window: it only cancels stale speculative requests
   assert.deepEqual(decodedTimes(store), windowChunks(store, 28, 52));
   const firstReads = chunkReads(readable).slice(0, 2).map((c) => c.range.offset);
   assert.equal(firstReads.length, 2);
-  assert.ok(store.peekRaw(0, 0, 0, 40) && store.peekRaw(0, 0, 0, store.anchorOf(40)));
+  assert.ok(store.peekRaw(0, 0, 0, 40));
 });
 
 test('after playback the viewer stays out of idle for idleMs, then a new allowance applies', async () => {
@@ -676,7 +674,7 @@ test('aborted idle fetches give their allowance back', async () => {
 });
 
 test('a window larger than the joint cap stops when the cap holds nothing worse, and never goes over it', async () => {
-  const readable = buildSyntheticStore({ ...AXIS, nTime: 60, encoding: 'none' });
+  const readable = buildSyntheticStore({ ...AXIS, nTime: 60 });
   const store = await openStore('memory://cap-stop', { store: readable, workers: 0, clock: () => 0, speculativeBytesInitial: 1e12, totalBytes: SMALL_CHUNK * 20 });
   store.evictionScore = (entry) => Math.abs(entry.t - 30);
   const result = await store.prefetch({ lod: 0, cells: [[0, 0]], t: 30, playing: true, concurrency: 1 });
@@ -727,7 +725,7 @@ test('cancelling an entry nobody waits for leaves no unhandled rejection', async
 
 // ---- masks ----
 
-const MASKED = { nTime: 24, nBand: 1, height: 64, width: 64, chunk: 32, anchorInterval: 4, sharded: true, specVersion: '0.2.0', mask: true };
+const MASKED = { nTime: 24, nBand: 1, height: 64, width: 64, chunk: 32,  sharded: true, specVersion: '0.3.0', mask: true };
 
 test('the mask cache is a tenth of the joint cap, at least 64 MiB, and follows setBudgets', async () => {
   const MIB = 1024 * 1024;

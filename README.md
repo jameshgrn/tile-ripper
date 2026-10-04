@@ -4,15 +4,11 @@ Start with [Bring your own data](examples/bring_your_data/README.md): convert yo
 
 Open a decade of analysis-ready satellite time series in a browser tab from a static bucket. Scrub it like video. Click for real numbers.
 
-**chronozarr** is an open raster time-series format with a browser viewer at [chronozarr.org/demo](https://chronozarr.org/demo/): plain Zarr v3 with one group per pyramid level and one object per chunk, so a timestep of a spatial cell is one plain `GET`. Sharding, one file per cell for the time axis, is an option (`--shard`). The layout follows ndpyramid's `multiscales` attribute and the zarr `proj` and `spatial` conventions. An optional temporal profile, star-delta, stores most timesteps as residuals against a nearby anchor; the writer measures a sample of cells and enables it only when it shrinks the compressed bytes to 0.85 of the plain size or better. A store without it needs no chronozarr-aware reader.
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
 
-Reading a store without chronozarr:
+GDAL 3.13.3 read the two-level v0.3 fixture with correct EPSG:32618, transforms and all six oracle values, without warnings, both with and without `_CRS`; selected raster slices did not expose automatic overviews. CarbonPlan zarr-layer 0.10.0 with zarrita 0.7.5 rendered it without CRS, bounds or spatial-dimension overrides and returned 1107 at the checked pixel centre. Separate-mask handling and framebuffer color calibration were not established. See [reader evidence](docs/geozarr-profile.md#8-reader-spike).
 
-- xarray and other zarr-python 3 or zarrita clients open both layouts, unsharded (the default) and sharded (`tests/test_xarray_compat.py`). With chronozarr installed, `xr.open_dataset(path_or_url, engine="chronozarr")` also reconstructs star-delta timesteps lazily and returns float32 physical values (`stored * scale + offset`, NaN where invalid); `physical=False` returns the stored values.
-- GDAL reads the layout through its Zarr driver. Stores without sharding (the default) open in GDAL 3.12 as a raster of time-major bands; sharded stores need GDAL 3.13 or newer, where the driver documents sharding support ([GDAL Zarr driver](https://gdal.org/en/stable/drivers/raster/zarr.html)). The writer emits the `_CRS` array attribute that GDAL reads, so GDAL assigns the CRS of an EPSG store. In a star-delta store GDAL sees residuals for non-anchor timesteps. `chronozarr export-cog STORE OUT_DIR` writes true-value Cloud Optimized GeoTIFFs for GDAL and QGIS from any store, including for GDAL versions that cannot read the store directly (extra `geo`).
-- CarbonPlan zarr-layer reads the ndpyramid `multiscales` layout. A store without the temporal profile that was written after `pixels_per_tile` was dropped from `multiscales` (spec section 13) opens in zarr-layer unmodified (verified on the Ucayali store at level 1, point values equal to a direct Zarr read); a store written earlier opens with zarr-layer's `crs` and `bounds` constructor options; a star-delta store needs an adapter that reconstructs the residuals.
-
-Spec: [spec/CHRONOZARR.md](https://github.com/chronozarr/chronozarr/blob/main/spec/CHRONOZARR.md) (v0.2, draft). Hosting: [docs/hosting.md](https://github.com/chronozarr/chronozarr/blob/main/docs/hosting.md). Growing a store: [docs/append.md](https://github.com/chronozarr/chronozarr/blob/main/docs/append.md). Embedding the viewer: [docs/embedding.md](https://github.com/chronozarr/chronozarr/blob/main/docs/embedding.md). Comparison with other formats: [docs/format-comparison.md](https://github.com/chronozarr/chronozarr/blob/main/docs/format-comparison.md).
+Spec: [v0.3.0](spec/CHRONOZARR.md). [Hosting](docs/hosting.md), [appending](docs/append.md), [embedding](docs/embedding.md) and [format comparison](docs/format-comparison.md).
 
 ## Who this is for
 
@@ -25,7 +21,7 @@ Spec: [spec/CHRONOZARR.md](https://github.com/chronozarr/chronozarr/blob/main/sp
 
 | Part | Path | What it does |
 |------|------|--------------|
-| Format spec | `spec/CHRONOZARR.md` | Normative layout (one object per chunk by default, sharding optional), attributes, temporal encoding, pyramid, hosting rules |
+| Format spec | `spec/CHRONOZARR.md` | Normative layout (one object per chunk by default, sharding optional), attributes, true values, pyramid, hosting rules |
 | Python package `chronozarr` | `src/chronozarr/` | `encode()`, `open_store()`, `validate()`, `view()`; CLI `chronozarr encode / convert / append / validate / info / doctor / export-cog / stac`; xarray engine `chronozarr` |
 | JS reader | `js/chronozarr/` | DOM-free reader on top of zarrita: cells by (lod, row, col, t), cache, prefetch |
 | MapLibre layer | `js/maplibre/` | Custom layer that renders a store through the JS reader |
@@ -39,20 +35,20 @@ Spec: [spec/CHRONOZARR.md](https://github.com/chronozarr/chronozarr/blob/main/sp
 
 - **PMTiles** packs tiles, images or vectors, for one moment. Its tile scheme is Web Mercator in practice and it has no native time axis; per-tile values are whatever the image encoding carries.
 - **Mapbox raster-array** (MRT) is multi-band numeric tiles with a time series. Its decoder code is published in mapbox-gl-js (`src/data/mrt`), but the format is tied to Mapbox's tiling service and renderer.
-- **CarbonPlan ndpyramid + zarr-layer** put Zarr pyramids in MapLibre with a time selector. zarr-layer supports arbitrary CRS through proj4 reprojection. Each timestep is its own chunk fetch, and stock zarr-layer needs an adapter to reconstruct star-delta residuals.
+- **CarbonPlan ndpyramid + zarr-layer** put Zarr pyramids in MapLibre with a time selector. zarr-layer supports arbitrary CRS through proj4 reprojection. Each timestep is its own chunk fetch. The v0.3 fixture opens without metadata overrides (reader evidence above).
 
-chronozarr keeps native projection and lossless values, serves a timestep as one plain `GET` of one chunk, and pre-stages a window of the time axis in the client so a timestep switch costs zero bytes on the wire once cached. The temporal encoding is the optional part: it was about 25% smaller on arid scenes, about 6% on vegetated ones, and 2.6% on the whole Ucayali demo store, so the writer decides per store. The layout is a trade the writer makes too: unsharded (the default) is one object per cell, level and timestep (about 5,900 for the 117-month imagery store), with no index reads, cheap CDN misses and appends that write only new objects; sharded (`--shard`) is 93 objects and one range read per timestep once the shard index is cached, with a CDN miss that costs time proportional to the shard size. [docs/format-comparison.md](https://github.com/chronozarr/chronozarr/blob/main/docs/format-comparison.md) has the row-by-row table, including when to choose each of the other tools.
+chronozarr keeps native projection and lossless values, serves a timestep as one plain `GET` of one chunk, and pre-stages a window of the time axis in the client so a timestep switch costs zero bytes on the wire once cached. The layout is a trade the writer makes: unsharded (the default) is one object per cell, level and timestep (about 5,900 for the 117-month imagery store), with no index reads, cheap CDN misses and appends that write only new objects; sharded (`--shard`) is 93 objects and one range read per timestep once the shard index is cached, with a CDN miss that costs time proportional to the shard size. [docs/format-comparison.md](https://github.com/chronozarr/chronozarr/blob/main/docs/format-comparison.md) has the row-by-row table, including when to choose each of the other tools.
 
 ## Install
 
-The first release (0.2.0 of both packages) is pending: `chronozarr` is not on PyPI and `chronozarr` is not on npm yet, so the install commands below fail until the `v0.2.0` tag is published. Both packages release from one `v*` tag, so their versions move together.
+This checkout prepares `chronozarr` 0.3.0 for PyPI and npm. Both packages publish from one `v*` tag.
 
 ```bash
 pip install chronozarr              # Python package and CLI; extras: geo (GeoTIFF input), notebook (view()), netcdf, dask
 npm install chronozarr           # JavaScript reader and MapLibre layer
 ```
 
-Until then, work from a checkout of this repository:
+To work from a checkout of this repository:
 
 ```bash
 uv sync                      # Python package and CLI; add --extra geo for GeoTIFF input, --extra notebook for view()
@@ -66,7 +62,7 @@ uv run chronozarr --help
 ```python
 import chronozarr
 
-chronozarr.encode(da, "my_store", crs="EPSG:32631")   # da: (time, band, y, x) with x/y coordinates; the writer picks the temporal encoding
+chronozarr.encode(da, "my_store", crs="EPSG:32631")   # da: (time, band, y, x) with x/y coordinates; true stored values at every timestep
 store = chronozarr.open_store("my_store")
 store.read(t=42)                        # (band, y, x), exact stored values
 store.to_xarray(lod=0)
@@ -80,7 +76,7 @@ uv run chronozarr export-cog my_store cogs/           # true-value COGs for GDAL
 uv run chronozarr stac my_store --out catalog/        # static STAC Collection and Item (extra geo)
 ```
 
-A plain reader needs no chronozarr at all (anchor timesteps are exact; in a star-delta store the other timesteps are residuals):
+A plain Zarr reader reads true stored values without chronozarr:
 
 ```python
 import xarray as xr
@@ -100,11 +96,11 @@ js/demo/index.html?store=https://your-bucket/my_store
 
 | Command | What it does |
 |---------|--------------|
-| `encode INPUT OUT` | Encode a Zarr store or NetCDF file with dims `(time, band, y, x)`, or a quoted glob of GeoTIFFs with the date in the file name, into a store. Options include `--encoding auto\|none\|star-delta`, `--codec`, `--level`, `--chunk-size`, `--shard/--no-shard` (default off), `--shard-time` (needs `--shard`), `--lods`. |
-| `convert SOURCE OUT` | Convert a manifest (`.csv` with `uri,datetime[,bands]`, or `.json`) of COGs or georeferenced PNG frames (world file plus `--crs`, `.aux.xml`, or `--bounds` with `--crs`; RGBA alpha becomes the mask), a Zarr store or a NetCDF file into a store one timestep at a time, without loading the whole stack. Warps COGs that are off the target grid (`--crs`, `--transform`, `--shape`, `--resampling`), stages timesteps so `--resume` can continue an interrupted run, and `--dry-run` prints the size and time estimate only. Takes the encode options too (`--encoding`, `--codec`, `--chunk-size`, `--shard-time`, `--read-ahead`). |
+| `encode INPUT OUT` | Encode a Zarr store or NetCDF file with dims `(time, band, y, x)`, or a quoted glob of GeoTIFFs with the date in the file name, into a store. Options include `--codec`, `--level`, `--chunk-size`, `--shard/--no-shard` (default off), `--shard-time` (needs `--shard`), `--lods`. |
+| `convert SOURCE OUT` | Convert a manifest (`.csv` with `uri,datetime[,bands]`, or `.json`) of COGs or georeferenced PNG frames (world file plus `--crs`, `.aux.xml`, or `--bounds` with `--crs`; RGBA alpha becomes the mask), a Zarr store or a NetCDF file into a store one timestep at a time, without loading the whole stack. Warps COGs that are off the target grid (`--crs`, `--transform`, `--shape`, `--resampling`), stages timesteps so `--resume` can continue an interrupted run, and `--dry-run` prints the size and time estimate only. Takes the encode options too (`--codec`, `--chunk-size`, `--shard-time`, `--read-ahead`). |
 | `append STORE INPUT` | Add timesteps at the end of an existing store: another store (for example one month written by `convert`), a Zarr store, a NetCDF file or a GeoTIFF glob. Writes only the objects that gain data and leaves every existing chunk byte-identical. The default unsharded layout appends by writing only new objects, where a sharded store rewrites its trailing shard; see [docs/append.md](https://github.com/chronozarr/chronozarr/blob/main/docs/append.md). |
 | `validate STORE` | Check a store against the spec. Exit status 1 if it does not conform. |
-| `info STORE` | Summarise a store: times, bands, temporal encoding and pyramid levels. |
+| `info STORE` | Summarise a store: times, bands and pyramid levels. |
 | `doctor TARGET` | Diagnose an https URL or a local store path. A URL is probed as a browser would: root `zarr.json`, byte ranges, CORS, `HEAD` and caching headers. Both kinds then get the layout validated and one cell per level decoded and compared with a plain Zarr read. Exit status 1 only if a check fails; warnings and info lines are advice. `--origin` sets the `Origin` header. |
 | `export-cog STORE OUT_DIR` | Write timesteps as true-value Cloud Optimized GeoTIFFs readable by GDAL and QGIS, one file per timestep. `--level` picks the pyramid level, `--times` picks timesteps (`all`, indices, slices, dates, date ranges). Needs extra `geo`. |
 | `stac STORE --out DIR` | Write a static STAC Collection and Item for a store: the Zarr asset, extent, band metadata, the datacube extension and the recorded provenance. `--href` sets the public store location. Needs extra `geo`. |
@@ -130,7 +126,19 @@ Four real Ucayali LOD 0 chunks (2,097,152 bytes each), zarrita 0.7.5 with vendor
 
 Byte shuffle did not shrink the zstd stream on this data. The 10.4% size penalty alone keeps zstd level 5 as the default; blosc is permitted.
 
-Temporal encoding, compressed bytes of star-delta against plain storage with the same codec: about 25% smaller on arid scenes, about 6% smaller on vegetated ones, and 2.6% smaller (6,285.2 MB against 6,451.9 MB) on the full Ucayali demo store. The writer samples level 0 cells and keeps star-delta only at 0.85 of the plain size or better.
+v0.3 versus v0.2, five interleaved A/B rounds on unchanged readers, localhost, headless Chrome 154, 1280 × 900, DPR 1, Ucayali LOD 0, 36 cells, 2026-10-03. Evidence: `data/spike/js_v03_bench.json`, `hypothesis_1.unchanged` (local, gitignored). Medians of the five round medians:
+
+| Measurement | v0.2 | v0.3 |
+|---|---:|---:|
+| Cold complete frame | 87.4 ms | 91.1 ms |
+| Warm stepping | 4.9 ms | 4.5 ms |
+| Decode per 2 MiB chunk | 4.4 ms | 4.4 ms |
+| Cold requests | 37 | 37 |
+| Cold response-body bytes | 39,084,594 | 39,088,419 |
+
+v0.3 = v0.2 within noise. The earlier non-interleaved timings are superseded. Some warm stepping and jumping samples are incomplete, so their medians do not establish a complete-frame gate pass. Zero sampled wire bytes do not establish zero traffic over the entire phase. No tuning was adopted.
+
+Historical viewer measurements below used earlier format versions and are retained as dated evidence, not v0.3 release gates.
 
 Viewer on the v0.1 Sahara store (128 months, 4 bands, 6 x 6 cells at LOD 0, 3.9 GB in 93 files), localhost, HTTP cache bypassed, 2026-09-29:
 
@@ -198,7 +206,7 @@ The encoder default is now unsharded: a cold open of the published sharded store
 
 Cold open of the live unsharded store `chronozarr-4` from the deployed viewer with a cold edge cache, 2026-10-01: first whole frame 390 ms, complete frame at the target level 622 ms, against 6.8 s on the sharded store the same morning, where 6.5 s were the nine shard-index reads missing the edge cache. Publishing it took 274 s for 5,893 objects through the R2 S3 API (`scripts/r2_sync.py`), 150 s for the 17,088 objects of the water store. An append to a live store has not been exercised yet.
 
-Star-delta reconstruction runs in the fragment shader; the CPU loop it replaces cost 54 ms per 36-cell frame. Known limits: the coarse loop pulls the whole time axis at its level after the first frame (tens of MB for a store a few cells wide); cold open of very small stores costs 30 to 40 ms for worker startup.
+Known limits: the coarse loop pulls the whole time axis at its level after the first frame (tens of MB for a store a few cells wide); cold open of very small stores costs 30 to 40 ms for worker startup.
 
 ## Development checks
 
@@ -241,6 +249,4 @@ and bytes alongside timings; local/loopback results do not measure CDN performan
 
 v0.2 draft (spec version `0.2.0`; every v0.1 store is a valid v0.2 store and readers accept both). The layout is Zarr v3 groups per level. The writer default is unsharded: one object per chunk, that is per cell, level and timestep (about 5,900 objects for the 117-month imagery store), so there is no shard index to read, a CDN miss costs one chunk and an append writes only new objects. Sharding stays available (`--shard`, `shard_time`) and every store written sharded stays valid: 93 objects and one range read per timestep once the shard index is cached, with a miss that costs time proportional to the shard size.
 
-The public demo store is `ucayali_santa_maria/chronozarr-4`: the Ucayali River near Santa María, Peru, 117 monthly Sentinel-2 composites from 2015 to 2026, served from an R2 bucket at data.tileripper.com. The suffixes `-3` and `-4` are immutable revisions of this dataset's storage prefix, not chronozarr format or package versions. Both use spec v0.2.0: `chronozarr-3` was the historical sharded layout (6,451.9 MB in 93 files); the current `chronozarr-4` uses the unsharded default (6,451.8 MB in 5,893 files, values bit-identical). The writer's auto rule chose temporal encoding `none`: star-delta compressed to 0.988 of the plain size on the sampled cells, far short of the 0.85 needed to keep it. The same data with star-delta forced is 6,285.2 MB, so the plain store is 166.7 MB (about 2.7%) larger. That is the price of a store any Zarr v3 reader decodes without an adapter. The Measured tables above were taken on earlier stores of this reach and of the Sahara. Sahara and Iowa remain the benchmark pair and can be re-encoded from the ingest example. The legacy data hostname is retained for existing store URLs; the demo is at chronozarr.org/demo/.
-
-A derived water store, `ucayali_santa_maria/water-2`, uses the same mosaics: NDWI as int16 with a scale of 1e-4, water as a scaled fraction, and a validity mask where no scene was observed, built by `examples/water_masks/`. It is the unsharded revision (1.73 GB in 17,088 files, values bit-identical to the historical sharded `water-1`, 201 files). It exercised a dtype other than uint16, explicit masks and physical units through the whole path. The current catalog lists the imagery store and the PNG frames demo (`png-1`); it does not list the water store. Stores can grow with `chronozarr append`, the viewer embeds in other pages with `?embed=1`, and georeferenced PNG frames convert directly.
+The catalog currently points to the historical v0.2 Ucayali store `ucayali_santa_maria/chronozarr-4` (117 monthly Sentinel-2 composites, 5,893 objects, 6,451,765,726 bytes). The local migrated v0.3 store is `data/stores/ucayali_santa_maria_v03` (5,893 objects, 6,451,772,327 bytes). Publication and the catalog change are pending. v0.3 readers reject v0.2 stores; use `chronozarr convert` or a pinned v0.2 reader for historical artifacts. The legacy data hostname remains intentional. The PNG catalog entry also requires migration before use with v0.3.

@@ -30,7 +30,7 @@ def run(root: Path) -> None:
             writer.writeheader()
             writer.writerows(subset)
     target = root / "series"
-    convert(source / "first-eleven.csv", target, encoding="star-delta", anchor_interval=6)
+    convert(source / "first-eleven.csv", target)
     convert(source / "last-date.csv", root / "last-date", encoding="none")
     old = chronozarr.open_store(target)
     old_times = old.times.copy()
@@ -90,7 +90,7 @@ def run(root: Path) -> None:
     result = {
         "dates": [r["datetime"] for r in rows],
         "shape": list(new.levels[0].shape),
-        "encoding": "explicit star-delta, anchor_interval=6",
+        "encoding": "v0.3 true values",
         "valid_fractions": coverage,
         "frame_sha256": hashes,
         "mask_sha256": mask_hashes,

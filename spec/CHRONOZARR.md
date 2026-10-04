@@ -1,602 +1,426 @@
-# chronozarr v0.2
+# chronozarr v0.3.0
 
 **Status:** Draft
-**Date:** 2026-09-30
-**Spec version string:** `0.2.0`
-**Supersedes:** chronozarr v0.1 (`0.1.0`); `CHRONOFABRIC.md` (ChronoFabric v1: Zarr v2, one array per cell, `manifest.json`)
 
-## 0. Purpose
+**Date:** 2026-10-03
 
-chronozarr is a Zarr v3 layout convention for raster time series (satellite image stacks, gridded products). A browser opens a decade of analysis-ready data from a static bucket, scrubs through time like video, and returns the exact stored value on click. It is a **convention plus a reader**. It is not a codec and not a new container: every object in a chronozarr store is a plain Zarr v3 object, readable by any Zarr v3 library that supports the store's codecs.
+**Spec version string:** `0.3.0`
 
-A store uses one of two temporal encodings (§4). With `none`, the data array holds the true values of every timestep and any Zarr v3 reader reads the store without this spec. With `star-delta`, non-anchor timesteps hold residuals against an anchor timestep, and a chronozarr-aware reader is required to reconstruct them. The writer chooses between the two per store and enables `star-delta` only where it reduces compressed size (§4.3).
+**Supersedes:** chronozarr v0.2.0 through explicit store conversion. This draft does not assert that existing chronozarr libraries implement v0.3.0.
 
-The star-delta encoding cannot be a per-chunk Zarr codec: decoding a delta timestep needs the anchor chunk, which is a different chunk. A plain Zarr reader (`xarray.open_zarr`, zarrita) of a `star-delta` store sees anchor timesteps correctly and non-anchor timesteps as residuals in the stored dtype. This is the documented cost of that encoding.
+## 0. Scope and upstream references
 
-MUST, MUST NOT, SHOULD, SHOULD NOT, MAY are used as in RFC 2119.
+chronozarr defines a true-value raster time-series profile of Zarr v3, with a multiscale pyramid, band descriptions, validity planes, metadata mirrors and static publishing rules. Every array contains ordinary stored values. Physical units are obtained by applying the declared band scale and offset; stored values need no chronozarr-specific reconstruction. The profile supports a single EPSG north-up grid per store. It composes the zarr-conventions **multiscales**, **proj** and **spatial** conventions; it is aligned with this GeoZarr convention work, not certified against an adopted OGC GeoZarr standard.
 
-## 1. Invariants
+MUST, MUST NOT, SHOULD, SHOULD NOT and MAY express requirements as in RFC 2119. Sections 0.3 and 10, examples explicitly labelled informative, and implementation observations are informative. Other sections are normative. Upstream requirements incorporated below apply in addition to chronozarr restrictions. Registration URLs identify the literal v0.1 conventions; snapshot identities are documentation provenance, not store attributes.
 
-1. **Lossless roundtrip.** `encode(data)` then a read of level 0 returns the exact input values in the stored dtype, under either temporal encoding. No quantization, no rounding, no lossy compression of the data; coarser levels are block means of it (§6).
-2. **O(1) random timestep access.** Any timestep at any level decodes with at most two chunk reads: one anchor plus one delta (one read under `none`). No chain accumulation, no sequential dependency. In a sharded store the two chunks may live in different shards (§7.4).
-3. **dtype preservation.** Values are stored and served in the store's dtype (§2.3). The format never converts between integer and float and never quantizes. Physical values are derived at read time from `scale` and `offset` (§3.6); they are not stored.
-4. **Self-describing.** Group and array attributes fully describe layout, temporal encoding, CRS and chunk grid. No sidecar files, no external metadata.
+### 0.1 Normative upstream authorities
 
-## 2. Store layout
+| ID | Authority | Sections used by this profile |
+|---|---|---|
+| Z | [Zarr core 3.1](https://zarr-specs.readthedocs.io/en/latest/v3/core/) | Concepts and terminology (Hierarchy), Stored representation, Metadata, Array metadata, Group metadata, Chunk grids, Chunk encoding, Storage and Extensions. The store's `zarr_format` remains 3. |
+| F | [Zarr Conventions Specification](https://github.com/zarr-conventions/zarr-conventions-spec/blob/d8077b612759013c0380c4ee562ade2873141da4/README.md) | Definition, Convention Registration via `zarr_conventions`, Convention Properties and Composability. |
+| M | [multiscales v0.1](https://github.com/zarr-conventions/multiscales/blob/v0.1/README.md) | Configuration, Layout Object, Transform Object, Hierarchical Layout, Group Discovery Methods and Consolidated Metadata. |
+| P | [proj v0.1](https://github.com/zarr-conventions/proj/blob/v0.1/README.md) | Properties and Inheritance Rules. |
+| S | [spatial v0.1](https://github.com/zarr-conventions/spatial/blob/v0.1/README.md) | Properties, spatial:dimensions, spatial:transform, Coordinate convention, Coefficient ordering and spatial:registration. |
+| B | [Zarr bytes codec](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/bytes/) | Codec configuration and byte-order semantics. |
+| I | [Zarr indexed-sharding codec](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/sharding-indexed/) | Configuration, Index, Index location, Empty chunks, Encoding and Decoding. |
 
-A chronozarr store is a Zarr v3 hierarchy. Zarr v3 arrays are leaf nodes, so each LOD level is a **group** named `"0"`, `"1"`, ... holding one data array (default name `data`, declared in `chronozarr.variable`), optional `mask` and `coverage` arrays, and coordinate arrays. This is the shape ndpyramid writes and carbonplan/zarr-layer reads (`{store}/{level}/{variable}`).
+### 0.2 Rules inherited by reference
 
-```
-{store}/
-  zarr.json                      root group; attrs: multiscales, chronozarr                (§3.1)
-  volatility/
-    zarr.json                    array (grid_rows_0, grid_cols_0) float32                  (§5)
-    c/0/0
-  0/
-    zarr.json                    level group; attrs: crs, transform, resolution            (§3.3)
-    data/
-      zarr.json                  array (time, band, y, x), chunks (1, n_band, cs, cs)      (§2.1)
-      c/{t}/0/{r}/{c}            unsharded (default): one object per (timestep, cell)      (§7)
-      c/{ts}/0/{r}/{c}           sharded: one object per (time shard, cell)
-    mask/                        optional: array (time, y, x) uint8                        (§2.4)
-      zarr.json
-      c/{t}/{r}/{c}              unsharded (default); sharded is c/{ts}/{r}/{c}
-    coverage/                    optional: array (time, y, x) uint8                        (§2.5)
-      zarr.json
-      c/{ts}/{r}/{c}
-    time/  zarr.json  c/0        int64 ms since epoch, length n_time
-    band/  zarr.json  c/0        band names, length n_band
-    y/     zarr.json  c/0        float64 projected y of pixel centres, length H_0
-    x/     zarr.json  c/0        float64 projected x of pixel centres, length W_0
-  1/
-    ...                          same members; H_1 = ceil(H_0 / 2), W_1 = ceil(W_0 / 2)
-  2/ ...                         consecutive levels until the grid is 1x1                  (§6)
-```
+The following mechanisms are defined by their upstream sections, rather than restated by chronozarr. Profile choices that restrict their use appear in the later sections.
 
-### 2.1 Data array `{level}/{variable}`
-
-| Field | Value |
+| Mechanism | Governing upstream section |
 |---|---|
-| `shape` | `[n_time, n_band, H_k, W_k]` |
-| `data_type` | `uint8`, `uint16`, `int16` or `float32` (§2.3). Identical at every level. |
-| `chunk_grid` | `regular`. Unsharded (the writer default): `chunk_shape = [1, n_band, cs, cs]`. Sharded: §7. |
-| `chunk_key_encoding` | `default`, separator `/`, so keys are `c/...` |
-| `fill_value` | `chronozarr.nodata` when it is a number; otherwise `0` |
-| `codecs` | `bytes` (`endian: little`) then one compression codec (§8), inside `sharding_indexed` when sharded |
-| `dimension_names` | `["time", "band", "y", "x"]` |
-| `attributes` | `_ARRAY_DIMENSIONS: ["time","band","y","x"]`; `nodata` (same value as `chronozarr.nodata`) present only when that value is a number |
+| Hierarchy and array/group node semantics | Z, Concepts and terminology / Hierarchy; Stored representation; Metadata. |
+| Edge chunk extent and exclusion of elements outside array shape | Z, Chunk grids; Array metadata / shape. The profile's fill-padding choice is in §2.1. |
+| Byte order for one-byte element types | B, Configuration / endian. |
+| Consolidated discovery and its recommendation | M, Consolidated Metadata. The reader fallback is in §9.2. |
+| Six affine coefficients, coefficient ordering and index-to-coordinate corner interpretation | S, spatial:transform / Coordinate convention / Coefficient ordering. North-up and factor-two restrictions are in §§2.3 and 3.3. |
+| Shard index representation, index checksums, index placement, empty entries, absent-shard fill and omission of all-fill shards | I, Index, Index location and Empty chunks. Profile interoperability choices are in §7.2. |
+| Node metadata representation and naming | Z, Stored representation; Array metadata; Group metadata. |
+| Standard shard decoding and array bounds | I, Decoding; Z, Array metadata / shape and Chunk grids. Profile access and missing-data interpretation are in §§4, 7 and 9. |
 
-- `cs` (chunk size) MUST be identical at every level and even. Writers SHOULD use 256 or 512 (default 512; 256 suits low-latency stores). Readers MUST take `cs` from the data array's spatial inner chunk size, `chunk_shape[2]` (of the `sharding_indexed` codec's `chunk_shape` when sharded; `chunk_shape[3]` is equal), MUST NOT assume either value, and MUST NOT reject another even value (the reference writer accepts smaller even sizes for test fixtures). Readers MUST NOT take `cs` from `multiscales`, which carries no tile size (§3.4).
-- The band chunk index is always 0: one chunk holds every band of one timestep of one cell.
-- Cell `(r, c)` at level `k` is array slice `[:, :, r*cs:(r+1)*cs, c*cs:(c+1)*cs]`; row 0 is the top (north) edge. `grid_rows_k = ceil(H_k / cs)`, `grid_cols_k = ceil(W_k / cs)`.
-- **Edge chunks** are ordinary Zarr chunks: stored at full `cs x cs`; elements outside `shape` equal `fill_value`. Readers MUST discard elements beyond `shape`. There is no edge-size formula and no per-chunk size metadata. Padding is `fill_value` in anchors and 0 in residuals, so it costs almost nothing after compression.
+The regular-grid and default chunk-key-encoding mechanisms are likewise those of Z, Chunk grids and Storage / Chunk key encoding; chronozarr selects the particular choices in §2.1. Compression algorithms and binary representations follow their upstream codec specifications; §7.3 restricts the supported configurations.
 
-### 2.2 Coordinate arrays `{level}/{time,band,y,x}`
+### 0.3 Informative reference snapshots
 
-| Array | `data_type` | Contents |
+These are the inspected snapshots recorded by the migration plan. They document the source versions inspected; convention registrations instead use the literal URLs required in §3.1. The historical sources below do not impose TileMatrixSet or archived GeoZarr requirements on this profile.
+
+| Source | Inspected immutable snapshot | Date / role |
 |---|---|---|
-| `time` | `int64` | Milliseconds since Unix epoch. Attrs `units: "milliseconds since 1970-01-01T00:00:00"`, `calendar: "proleptic_gregorian"` (CF), so xarray decodes to `datetime64` natively. MUST be strictly increasing. Any cadence: monthly, weekly, irregular. |
-| `band` | `string` (codec `vlen-utf8`) or `int32` | Band names in array order where the writer supports Zarr v3 strings; otherwise the band index `0..n_band-1`. |
-| `y` | `float64` | Projected y of pixel centres in `crs`, decreasing (north up). |
-| `x` | `float64` | Projected x of pixel centres in `crs`, increasing. |
+| GeoZarr SWG | [d636b05abbfaa9851d3f12e91335bda22a127243](https://github.com/zarr-developers/geozarr-spec/tree/d636b05abbfaa9851d3f12e91335bda22a127243) | 2026-07-06; informative convention-composition context. |
+| Archived OGC draft | [82cba263ff53db4a9ab25366e3e3ed3777ff3f77](https://github.com/zarr-developers/geozarr-spec/tree/82cba263ff53db4a9ab25366e3e3ed3777ff3f77/standard/template) | 2025-12-08; historical `archives-2025` design only. |
+| F | [d8077b612759013c0380c4ee562ade2873141da4](https://github.com/zarr-conventions/zarr-conventions-spec/blob/d8077b612759013c0380c4ee562ade2873141da4/README.md) | 2026-06-18; framework. |
+| M | [9b78efa75fef0fed302d9cf880037c569354d860](https://github.com/zarr-conventions/multiscales/blob/9b78efa75fef0fed302d9cf880037c569354d860/README.md) | 2026-06-12; v0.1, Pilot. |
+| P | [5ca5b2f92e5c7245f957d9128b289ee535f0720d](https://github.com/zarr-conventions/proj/blob/5ca5b2f92e5c7245f957d9128b289ee535f0720d/README.md) | 2026-06-12; v0.1, Pilot. |
+| S | [54d81b7ced0376e63ee10f34db31db7d08dcc28d](https://github.com/zarr-conventions/spatial/blob/54d81b7ced0376e63ee10f34db31db7d08dcc28d/README.md) | 2026-06-12; v0.1, Pilot. |
+| ndpyramid schema | [bad4c49461fe51cde7e1035a0504ed4d8780efa3](https://github.com/carbonplan/ndpyramid/blob/bad4c49461fe51cde7e1035a0504ed4d8780efa3/docs/schema.md) | 2026-04-06; historical layout comparison. |
+| Z / B / I | [ad8fc8df42441c84039c94569980e485e4c09870](https://github.com/zarr-developers/zarr-specs/tree/ad8fc8df42441c84039c94569980e485e4c09870/docs/v3) | 2026-09-21; core and codec sources. |
 
-- Every array in the store MUST set `dimension_names` and the attribute `_ARRAY_DIMENSIONS` to the same list (`dimension_names` is native Zarr v3; `_ARRAY_DIMENSIONS` is what xarray-v2-era tools read).
-- Each coordinate array SHOULD be a single chunk. `time` and `band` MUST be identical at every level.
-- The timestamps as ISO-8601 strings and the band names are duplicated in root attrs `chronozarr.times` and `chronozarr.band_names` (§3.2), so a JS reader never needs int64 or vlen strings. `chronozarr.times[i]` MUST be the ISO-8601 rendering of `time[i]`; `chronozarr.band_names[i]` MUST equal `band[i]` where `band` holds names.
+Pilot conventions may change before stabilizing. A later upstream convention version requires a deliberate profile revision; this draft declares v0.1. Measured reader evidence and its limits are in [the reader spike](../docs/geozarr-profile.md#8-reader-spike): xarray needs an explicit level group; GDAL 3.12.4 needs `_CRS` for CRS assignment; GDAL 3.13.3 assigns the CRS without that alias but exposes the tested pyramid as subdatasets rather than attached overviews. zarr-layer 0.10.0 with zarrita 0.7.5 rendered the true-value fixture and returned its known value at the correct map location. These observations do not establish append, performance or cross-origin hosting conformance for those readers.
 
-### 2.3 dtype and nodata profiles
+### 0.4 Reserved future work
 
-| `data_type` | `nodata` | `star-delta` | Pyramid mean (§6) |
+A storage extension for temporal encoding is reserved for future work and is outside this baseline. Such an extension must be fail-closed in unaware readers: an unaware reader MUST reject the extension before returning any encoded data as measurements. No storage-extension syntax, algorithm, registration or decoding mechanism is specified here. The baseline MUST NOT use temporal encoding or require another timestep to decode a data chunk; safely ignorable convention attributes cannot change stored-value interpretation into a storage-decoding operation.
+
+## 1. Scientific and access guarantees
+
+1. **Exact level-0 roundtrip.** A conforming writer followed by a conforming read of level 0 MUST return the exact input stored values in the input dtype. Writers MUST NOT quantize, round or apply lossy compression to level-0 data. Derived overview rounding is specified in §5.
+2. **Bounded random access.** Any timestep of any cell at any level MUST require only one data-chunk read after the relevant metadata and, if applicable, shard index are available. There is no sequential timestep dependency. Optional validity/coverage reads are separate plane reads, not additional data chunks.
+3. **dtype preservation.** Data MUST be stored and returned in the declared data dtype. The format MUST NOT convert between integer and float or quantize stored data. Physical values are derived at read time (§4.4); they are not substituted into the stored array.
+4. **Self-description.** Group and array metadata MUST fully describe layout, bands, timestamps, CRS, geometry, chunk grid, codecs and declared optional planes. A reader MUST NOT need a sidecar or an external metadata service to determine the store's values and geometry.
+5. **Ordinary values.** Every data, coordinate and auxiliary array MUST hold its true stored values. Reading with a generic Zarr v3 client that supports the declared codecs yields those values; interpreting physical units and profile validity still requires §§4 and 9.
+
+## 2. Time-series array profile
+
+### 2.1 Levels and data cells
+
+The root MUST contain consecutive level groups named `"0"`, `"1"`, …, with no gaps. Each group MUST contain the data array named by `chronozarr.variable`, coordinate arrays `time`, `band`, `y`, `x`, and any declared optional planes. The data variable name defaults to `"data"`; readers MUST NOT hardcode it. Level 0 is the native grid. Level shapes follow §5.
+
+| Data-array property | Profile restriction |
+|---|---|
+| Shape and axis order | MUST be `[n_time, n_band, H_k, W_k]`, with positive axis lengths and dimensions `["time", "band", "y", "x"]`. |
+| Data dtype | MUST be `uint8`, `uint16`, `int16` or `float32`, identical at every level. |
+| Grid / keys | MUST select Z's `regular` grid and `default` chunk-key encoding with separator `/`. |
+| Unsharded chunks | MUST have shape `[1, n_band, cs, cs]`; keys are `c/{t}/0/{r}/{c}`. |
+| Sharded chunks | MUST use §7.1; the spatial inner chunk size remains `cs`. |
+| Fill / nodata attribute | MUST follow §4.1. |
+| Codec chain | MUST follow §7.3, inside the indexed-sharding codec when applicable. |
+
+`cs` MUST be a positive even integer, identical at every level, with equal row and column chunk sizes. Writers SHOULD use 256 or 512, with 512 the default; readers MUST accept other positive even sizes, including small test fixtures. Readers MUST derive `cs` from the data array's spatial inner chunk dimensions (indices 2 and 3), using I's inner `chunk_shape` when sharded, and MUST NOT derive it from multiscales metadata or assume 256/512. Every data chunk MUST hold all bands of one timestep of one cell; the band chunk index is 0.
+
+At level `k`, cell `(r,c)` is the spatial slice `[r*cs:(r+1)*cs, c*cs:(c+1)*cs]` for any timestep and band. Row 0 is the north edge. The cell grid MUST equal `[ceil(H_k/cs), ceil(W_k/cs)]`. Elements used as out-of-shape padding by the upstream chunk representation MUST equal the ordinary `fill_value`; edge extent and bounds handling are governed by §0.2, not a separate chronozarr edge-size formula.
+
+### 2.2 Coordinates and dimensions
+
+| Coordinate | Dtype / contents | Requirements |
+|---|---|---|
+| `time` | `int64`, Unix epoch milliseconds, length `n_time` | MUST be strictly increasing. MUST carry `units: "milliseconds since 1970-01-01T00:00:00"` and `calendar: "proleptic_gregorian"` for native CF datetime interpretation. Monthly, weekly and irregular cadences are permitted. |
+| `band` | Zarr `string` with `vlen-utf8`, or `int32`, length `n_band` | MUST contain band names in array order when strings are used; otherwise MUST contain indices `0..n_band-1`. |
+| `y` | `float64`, length `H_k` | MUST contain decreasing projected pixel-centre y coordinates in the declared CRS. |
+| `x` | `float64`, length `W_k` | MUST contain increasing projected pixel-centre x coordinates in the declared CRS. |
+
+Every array, including coordinates and optional volatility, MUST declare `dimension_names` and `_ARRAY_DIMENSIONS` with identical lists. A coordinate array uses its own one-element dimension list. Each coordinate array SHOULD occupy a single chunk. The time and band coordinate values MUST be identical at every level. Coordinates MUST agree with the canonical spatial metadata (§3.3); x/y describe centres under S's pixel registration.
+
+The ISO timestamp and band-name mirrors MUST agree exactly with their coordinate sources (§3.4). If `band` contains integer indices, `band_names` MUST instead agree with the ordered `bands[].name`; names are not compared to those integer indices. Readers MUST NOT require int64 or variable-length string coordinate reads when valid mirrors supply the needed information.
+
+### 2.3 EPSG north-up grid restriction
+
+All spatial arrays MUST use the same EPSG CRS and north-up affine geometry. Non-EPSG CRSs and rotated grids are outside this profile. In the S coefficient notation, horizontal pixel scale MUST be positive, vertical pixel scale negative, and both rotation/shear coefficients zero. This restricts S's transform without redefining its coefficient ordering or mapping (§0.2).
+
+Writers SHOULD retain the native projected CRS of the AOI, for example its UTM zone. Writers SHOULD NOT reproject storage to Web Mercator: it does not preserve pixel ground area, which affects area-sensitive block means and statistics. The EPSG restriction does not make all EPSG CRSs equal-area. Geometry and mirror agreement follow §3.3.
+
+## 3. chronozarr attributes and mirrors
+
+### 3.1 Convention registration and root metadata
+
+The root MUST declare `chronozarr` and M in `attributes.zarr_conventions`, using F's Convention Metadata Objects. Every data, mask and coverage array MUST explicitly declare P and S on that array, rather than depend on inheritance for profile conformance. Coordinate arrays and ungeoreferenced volatility MUST NOT declare S. Other registrations MAY appear only when their conventions apply without changing the baseline's ordinary stored values.
+
+Each M/P/S registration MUST contain the following UUID, name and **literal** schema/spec URL pair. Commit-based URLs MUST NOT be emitted in these registrations. The convention snapshot identities in §0.3 MUST NOT be emitted as store metadata. F's allowed registration fields and semantics apply by reference; no snapshot or extra version field is added to the registration object.
+
+| Name | UUID | `schema_url` | `spec_url` |
 |---|---|---|---|
-| `uint8` | integer 0 to 255, or `null` | allowed | integer |
-| `uint16` | integer 0 to 65535, or `null` | allowed | integer |
-| `int16` | integer, or `null` | not allowed (`none`) | integer |
-| `float32` | finite number, or `null` | not allowed (`none`) | float |
+| `multiscales` | `d35379db-88df-4056-af3a-620245f8e347` | `https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json` | `https://github.com/zarr-conventions/multiscales/blob/v0.1/README.md` |
+| `proj` | `f17cb550-5864-4468-aeb7-f3180cfb622f` | `https://raw.githubusercontent.com/zarr-conventions/proj/refs/tags/v0.1/schema.json` | `https://github.com/zarr-conventions/proj/blob/v0.1/README.md` |
+| `spatial` | `689b58e2-cf7b-45e0-9fff-9cfc0883d6b4` | `https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v0.1/schema.json` | `https://github.com/zarr-conventions/spatial/blob/v0.1/README.md` |
 
-- `chronozarr.nodata` is one number or `null`. `null` means the store declares no nodata value. The writer default is `0` for `uint8` and `uint16` (as in v0.1 for `uint16`) and `null` for `int16` and `float32`.
-- When `nodata` is a number it MUST equal every data array's `fill_value` and `nodata` attribute. When it is `null`, `fill_value` is `0` and the attribute is absent.
-- **Validity.** A pixel is *valid* if `mask` exists and is 1 at that pixel; or, when no mask exists and `nodata` is a number, if its value differs from `nodata`; or, when neither applies, always. A reader that has a mask MUST use it and MUST NOT also compare against `nodata`. Invalid pixels are missing in band math, statistics, block means and charts.
-- Where `mask` is 0, the stored data value is not interpreted; writers SHOULD store `fill_value` there.
-- NaN is not interpreted by this spec and is not a valid `nodata`. Writers SHOULD NOT store NaN; they SHOULD mark gaps with `nodata` or `mask`.
-- `bytes` for a one-byte dtype has no byte order; its `endian` configuration MAY be omitted.
+The root chronozarr registration MUST contain `name: "chronozarr"` and `spec_url: "https://github.com/chronozarr/chronozarr/blob/main/spec/CHRONOZARR.md"`. Its profile version is recorded in the `chronozarr` block, not as a Convention Metadata Object field. This draft assigns no chronozarr UUID or schema URL.
 
-### 2.4 Mask `{level}/mask` (optional)
-
-`uint8`, dims `["time", "y", "x"]`, shape `[n_time, H_k, W_k]`, values 1 (valid) and 0 (invalid), `fill_value` 0, `_ARRAY_DIMENSIONS` set. Chunked like `data` without the band axis: unsharded `[1, cs, cs]`; sharded per §7 with shard shape `[shard_time, cs, cs]` and inner chunk `[1, cs, cs]`. Keys carry no band index: `c/{t}/{r}/{c}` unsharded, `c/{ts}/{r}/{c}` sharded.
-
-- A store has a mask at every level or at none. When present, root attr `chronozarr.mask_variable` is `"mask"`; when absent, that attribute is absent.
-- The mask is always stored as true values: it is never star-delta encoded.
-- Level `k` mask is the maximum over each 2 x 2 block of level `k-1` (1 if any source pixel is valid).
-
-### 2.5 Coverage `{level}/coverage` (optional)
-
-`uint8`, dims `["time", "y", "x"]`, shape `[n_time, H_k, W_k]`. The value is the number of valid observations behind the pixel (saturating at 255); `0` means the pixel was gap-filled or never observed. `fill_value` 0. Layout and chunking are identical to `mask` (§2.4), and it is never star-delta encoded.
-
-- A store has coverage at every level or at none. When present, `chronozarr.coverage_variable` is `"coverage"`; when absent, that attribute is absent.
-- Level `k` coverage is the mean of each 2 x 2 block of level `k-1`, rounded to the nearest integer with halves rounded up: `(sum + 2) // 4`.
-- Coverage is independent of `mask`: a gap-filled pixel is valid data with coverage 0. How gaps were filled is recorded in `chronozarr.provenance.gap_fill` (§3.8).
-
-## 3. Attributes
-
-### 3.1 Root group
-
-| Key | Type | Rule |
-|---|---|---|
-| `multiscales` | list | ndpyramid schema (§3.4). Exactly one entry. |
-| `chronozarr` | object | §3.2. |
-
-Writers SHOULD also write zarr-python 3 `consolidated_metadata` into the root `zarr.json` so a reader learns every array's shape and codecs in one GET. Readers MUST fall back to per-array `zarr.json` when it is absent.
+The root MUST carry a `chronozarr` object (§3.2) and a `multiscales` object conforming to M (§3.3). Consolidated metadata and its recommendation follow M, Consolidated Metadata (§0.2); readers MUST retain the nonconsolidated fallback in §9.2.
 
 ### 3.2 `chronozarr` block
 
-Complete instance in the root example, §3.9.
-
-| Field | Type | Rule |
+| Field | Type | Profile rule |
 |---|---|---|
-| `spec_version` | string | `0.2.x` for stores written to this spec. Readers MUST accept `0.1.x` and `0.2.x` and MUST reject every other version. |
-| `variable` | string | Name of the data array inside each level group. Default `"data"`. Readers MUST NOT hardcode it. |
-| `times` | string[] | ISO-8601 timestamp per timestep, length `n_time`, equal to the `time` coordinate. |
-| `bands` | object[] | Band objects (§3.6) in array order, length `n_band`. Readers MUST also accept the v0.1 form, a list of strings, each read as a band object with only `name`. |
-| `band_names` | string[] | `name` of each entry of `bands`, in order. Writers MUST write it. Readers that find only `bands` derive it. |
-| `nodata` | number or null | §2.3. |
-| `crs` | string | `EPSG:<code>`. MUST equal every level's `crs` and every `multiscales.datasets[].crs`. A projected per-AOI CRS (UTM) SHOULD be used. Web Mercator SHOULD NOT: its pixels are not equal-area, so block means and statistics are biased. |
-| `temporal` | object | §4.1. |
-| `volatility_path` | string | Path of the volatility array relative to the root. `"volatility"` in v0.2. |
-| `mask_variable` | string | Optional. `"mask"` when `{level}/mask` exists (§2.4). |
-| `coverage_variable` | string | Optional. `"coverage"` when `{level}/coverage` exists (§2.5). |
-| `provenance` | object | Optional. §3.8. |
-| `levels` | object[] | §3.7. Writers MUST write it; readers MUST fall back to level metadata when it is absent. |
-| `shard_bytes` | object | Optional, sharded stores only. §7.3. |
+| `spec_version` | string | Writers MUST write exactly `"0.3.0"`. Readers MUST reject every other value, including missing values, before returning data, with a message directing the user to `chronozarr convert` (§9.1). |
+| `variable` | string | Data-array name inside each level, default `"data"`; MUST be declared by writers. |
+| `times` | string[] | MUST be written, length `n_time`; each entry MUST be the ISO-8601 rendering of the corresponding time coordinate. |
+| `bands` | object[] | MUST be written, length `n_band`; object-only band descriptions, §4.4. |
+| `band_names` | string[] | Writers MUST write the ordered `bands[].name`. Readers finding only `bands` MUST derive the names rather than read the band coordinate. |
+| `nodata` | number or null | MUST be declared; §4.1. |
+| `crs` | string | MUST be an `EPSG:<code>` mirror equal to canonical P metadata on every spatial array. |
+| `levels` | object[] | Writers MUST write the ordered mirrors in §3.4. Readers MUST support their absence through §9.2. |
+| `mask_variable` | string | MUST equal `"mask"` iff masks are present at every level; otherwise MUST be absent. |
+| `coverage_variable` | string | MUST equal `"coverage"` iff coverage is present at every level; otherwise MUST be absent. |
+| `volatility_path` | string | MAY be present; MUST equal `"volatility"` iff the optional root volatility array is present (§6). Otherwise MUST be absent. |
+| `provenance` | object | MAY be present; §4.5. |
+| `shard_bytes` | object | MAY be present only for sharded stores; §7.2. |
 
-The temporal block applies to every level: anchor schedule and references are shared across the pyramid.
+No temporal-encoding fields are part of this block. The baseline MUST NOT use attributes to reinterpret ordinary chunks as encoded measurements.
 
-### 3.3 Level group attributes
+### 3.3 Multiscales and authoritative geometry
 
-| Key | Rule |
-|---|---|
-| `crs` | Same string as `chronozarr.crs`. |
-| `transform` | 6 floats, rasterio/Affine order `[a, b, c, d, e, f]`: `x = a*col + b*row + c`, `y = d*col + e*row + f` for pixel corners. Level `k`: `[a*2^k, b, c, d, e*2^k, f]` (origin preserved). |
-| `resolution` | Ground sample distance in CRS units at this level: `abs(a) * 2^k`. |
+`multiscales` MUST use M's object form with `layout`. Its entries MUST be ordered by consecutive level groups `"0"`, `"1"`, …; each `asset` MUST be the group path, not a data-array path. Each level after 0 MUST declare `derived_from` equal to the preceding group and a relative transform with `scale: [2,2]` and `translation: [0,0]`, under M's Transform Object. `resampling_method` MUST be `"average"`; exact average semantics are chronozarr rules in §5. The base entry MAY carry the identity relative transform. Legacy list/datasets metadata and tile-size hints MUST NOT be written or used for v0.3 discovery.
 
-The data array SHOULD additionally carry `proj:code`, `spatial:dimensions` (`["y","x"]`), `spatial:shape`, `spatial:transform` and `spatial:bbox` (zarr-conventions `proj` and `spatial`, same values). zarr-layer reads these to detect a non-4326/3857 CRS instead of inferring it from bounds magnitude. When `crs` is an EPSG code the writer SHOULD also set `_CRS` on the array, `{ "url": "http://www.opengis.net/def/crs/EPSG/0/<code>" }` optionally with a `wkt` member: GDAL's Zarr driver reads this attribute to assign a CRS (its documentation names it the only CRS convention supported before GDAL 3.13). The array MAY also repeat `crs` and `transform`. Readers MUST NOT require any of these.
-
-### 3.4 `multiscales` (ndpyramid schema)
-
-One entry with `datasets[]`, `type` and `metadata` (instance in §3.9).
-
-- `datasets[i].path` is the level group name; `crs` equals `chronozarr.crs`. Writers emit only `path` and `crs` in an entry.
-- Writers MUST NOT write `pixels_per_tile`. Readers MUST ignore it if present: stores written before this rule carry it, and it is never the source of `cs` (§2.1). CarbonPlan zarr-layer 0.10.0 reads the key as the marker of a global Web Mercator slippy-map pyramid; with it present a native-CRS store opens as a blank map, and without it zarr-layer takes the extent from `proj:code`, `spatial:transform` and `spatial:bbox` (§3.3). The cell size is carried by the chunk shape of each level's data array (§2.1) and the cell grid by `chronozarr.levels` (§3.7), so nothing is lost. A validator MUST accept a store with or without the key.
-- Levels MUST be listed in order `"0"`, `"1"`, ... with no gaps.
-- `type` and `metadata.{method, version, args}` follow the ndpyramid schema page verbatim; `method` is nested under `metadata`, not top-level. `metadata.version` is `chronozarr 0.2.0` for new stores.
-- The zarr-conventions `multiscales` (object with `layout[]`) uses the same key with a different shape; a store cannot carry both. v0.2 keeps the ndpyramid list form, without `pixels_per_tile`, because zarr-layer reads it that way and the GeoZarr layout is still a proposal. Revisit when GeoZarr's multiscale layout is stable.
-
-### 3.5 Mirrors
-
-Three root attributes duplicate information that also lives in arrays or level groups, so a reader needs no vlen strings, int64 or per-level requests: `chronozarr.times` (mirrors the `time` coordinate), `chronozarr.band_names` (mirrors the `band` coordinate and `chronozarr.bands`) and `chronozarr.levels` (mirrors level attributes and array shapes, §3.7). A mirror MUST agree with its source; a validator checks this. Readers use the mirror as the primary source and MUST NOT require the source array to be read.
-
-### 3.6 Band objects
-
-Each entry of `chronozarr.bands` is an object:
-
-| Field | Type | Rule |
-|---|---|---|
-| `name` | string | Required. Unique within the store. Equals the `band` coordinate value where that holds names. |
-| `common_name` | string | Optional. SHOULD come from the STAC `eo:bands` common-name vocabulary where one applies (`red`, `green`, `blue`, `nir`, `swir16`, `swir22`, ...). |
-| `scale` | number | Optional, default 1. |
-| `offset` | number | Optional, default 0. |
-| `units` | string | Optional. Free text, for example `"reflectance"`. |
-
-- Physical value = `stored * scale + offset`. Invalid pixels (§2.3) are not scaled; they are missing.
-- The v0.1 string form carries no `scale`, so it reads as `scale` 1. A consumer that knows the source may supply one: the JavaScript reader assumes 0.0001, the Sentinel-2 L2A reflectance scale, for `0.1.x` stores. New stores SHOULD write `scale` and `offset` explicitly.
-- chronozarr does not set CF `scale_factor` or `add_offset` on the data array, so plain Zarr readers see stored values and scale-aware decoding is the consumer's choice.
-- Consumers that do band math or compute indices SHOULD select bands by `common_name`, falling back to `name`, and MUST apply `scale` and `offset` rather than assume a fixed reflectance scale. An RGB `uint8` store with bands `red`, `green`, `blue` and `scale` 1 therefore renders as stored.
-
-### 3.7 `levels` mirror
-
-`chronozarr.levels` is a list with one object per level, in level order, mirroring level metadata so a reader opens the store with one GET:
-
-| Field | Type | Rule |
-|---|---|---|
-| `path` | string | Level group name; equals `multiscales[0].datasets[i].path`. |
-| `resolution` | number | Equals the level group's `resolution`. |
-| `transform` | number[6] | Equals the level group's `transform`. |
-| `shape` | int[4] | `[n_time, n_band, H_k, W_k]`; equals the data array's `shape`. |
-| `grid` | int[2] | `[rows, cols]` of cells; equals `[ceil(H_k / cs), ceil(W_k / cs)]`. |
-
-The mirror MUST agree with the level group and array metadata; a validator checks it.
-
-### 3.8 `provenance` (optional)
-
-```json
-{ "sources": ["sentinel-2-l2a"], "composite": "monthly median", "gap_fill": "carry-forward", "notes": "SCL classes 4, 5, 6, 7 and 11 kept" }
-```
-
-| Field | Type | Rule |
-|---|---|---|
-| `sources` | string[] | Required. Collection ids or URLs of the input data. |
-| `composite` | string | Required. Free text describing the temporal composite, for example `"monthly median"`. |
-| `gap_fill` | string | Required. `"carry-forward"` (a pixel with no valid observation takes the previous timestep's value) or `"none"`. |
-| `notes` | string | Optional. |
-
-### 3.9 Complete example
-
-Store: 5 monthly timesteps, 2 bands, 700 x 600 pixels, `cs = 512`, EPSG:32631 at 10 m, `star-delta` with `anchor_interval = 2`, sharded with `shard_time = 4` (two time shards; the writer default is unsharded, §7.1), with `mask` and `coverage`. LOD 0 grid is 2 x 2; LOD 1 is 350 x 300, grid 1 x 1, so the pyramid stops there. Shard byte lengths are illustrative. The example uses `zstd` level 5, the writer default (§8).
-
-`zarr.json` (root):
+Informative example of a two-level object:
 
 ```json
 {
-  "zarr_format": 3,
-  "node_type": "group",
-  "attributes": {
-    "multiscales": [{
-      "datasets": [
-        { "path": "0", "crs": "EPSG:32631" },
-        { "path": "1", "crs": "EPSG:32631" }
-      ],
-      "type": "reduce",
-      "metadata": { "method": "block_mean", "version": "chronozarr 0.2.0", "args": [] }
-    }],
-    "chronozarr": {
-      "spec_version": "0.2.0",
-      "variable": "data",
-      "times": ["2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z", "2024-03-01T00:00:00Z", "2024-04-01T00:00:00Z", "2024-05-01T00:00:00Z"],
-      "bands": [
-        { "name": "B04", "common_name": "red", "scale": 0.0001, "offset": 0.0, "units": "reflectance" },
-        { "name": "B08", "common_name": "nir", "scale": 0.0001, "offset": 0.0, "units": "reflectance" }
-      ],
-      "band_names": ["B04", "B08"],
-      "nodata": 0,
-      "crs": "EPSG:32631",
-      "temporal": {
-        "encoding": "star-delta",
-        "anchor_interval": 2,
-        "anchor_indices": [0, 2, 4],
-        "delta_reference": { "1": 0, "3": 2 },
-        "selection": { "mode": "auto", "sampled_cells": 3, "ratio": 0.78 }
-      },
-      "volatility_path": "volatility",
-      "mask_variable": "mask",
-      "coverage_variable": "coverage",
-      "provenance": {
-        "sources": ["sentinel-2-l2a"],
-        "composite": "monthly median",
-        "gap_fill": "carry-forward",
-        "notes": "SCL classes 4, 5, 6, 7 and 11 kept"
-      },
-      "levels": [
-        { "path": "0", "resolution": 10.0, "transform": [10.0, 0.0, 746090.0, 0.0, -10.0, 2540440.0], "shape": [5, 2, 700, 600], "grid": [2, 2] },
-        { "path": "1", "resolution": 20.0, "transform": [20.0, 0.0, 746090.0, 0.0, -20.0, 2540440.0], "shape": [5, 2, 350, 300], "grid": [1, 1] }
-      ],
-      "shard_bytes": {
-        "0": {
-          "0/0/0": 1412807, "0/0/1": 388120, "0/1/0": 1290455, "0/1/1": 351902,
-          "1/0/0": 402211, "1/0/1": 101347, "1/1/0": 377689, "1/1/1": 96410
-        },
-        "1": { "0/0/0": 388554, "1/0/0": 98203 }
-      }
-    }
+  "multiscales": {
+    "layout": [
+      {"asset": "0"},
+      {"asset": "1", "derived_from": "0", "transform": {"scale": [2, 2], "translation": [0, 0]}}
+    ],
+    "resampling_method": "average"
   }
 }
 ```
 
-`0/zarr.json` (level group): `{ "zarr_format": 3, "node_type": "group", "attributes": { "crs": "EPSG:32631", "transform": [10.0, 0.0, 746090.0, 0.0, -10.0, 2540440.0], "resolution": 10.0 } }`
+Every spatial array MUST carry `proj:code: "EPSG:<code>"`, `spatial:dimensions: ["y","x"]`, `spatial:transform` and `spatial:registration: "pixel"`, and satisfy P/S. If `spatial:transform_type` is supplied it MUST be `"affine"`. Writers SHOULD also supply matching `proj:wkt2`. Optional `proj:projjson`, when supplied, MUST describe the same CRS. Optional `spatial:shape` MUST equal `[H_k,W_k]`; optional `spatial:bbox` MUST agree with the array's shape and S geometry. Equivalent properties supplied on M layout entries MUST agree with the spatial arrays. P/S are the authoritative CRS and geometry sources; chronozarr mirrors MUST NOT override them.
 
-`0/data/zarr.json` (sharded, two time shards of up to 4 timesteps):
+Level `k` MUST have the same origin as level 0 and both pixel scales multiplied by `2^k`; all spatial arrays in a level MUST agree geometrically. Each level group MUST retain `crs`, `transform` and `resolution` mirrors. `crs` MUST equal `proj:code`; `transform` MUST equal the canonical S coefficient list without introducing another mapping; `resolution` MUST equal the positive horizontal ground sample distance at that level. Group and root mirrors MUST be validated against canonical array metadata.
 
-```json
-{
-  "zarr_format": 3,
-  "node_type": "array",
-  "shape": [5, 2, 700, 600],
-  "data_type": "uint16",
-  "chunk_grid": { "name": "regular", "configuration": { "chunk_shape": [4, 2, 512, 512] } },
-  "chunk_key_encoding": { "name": "default", "configuration": { "separator": "/" } },
-  "fill_value": 0,
-  "codecs": [{
-    "name": "sharding_indexed",
-    "configuration": {
-      "chunk_shape": [1, 2, 512, 512],
-      "codecs": [{ "name": "bytes", "configuration": { "endian": "little" } }, { "name": "zstd", "configuration": { "level": 5, "checksum": false } }],
-      "index_codecs": [{ "name": "bytes", "configuration": { "endian": "little" } }, { "name": "crc32c" }],
-      "index_location": "end"
-    }
-  }],
-  "dimension_names": ["time", "band", "y", "x"],
-  "attributes": { "_ARRAY_DIMENSIONS": ["time", "band", "y", "x"], "nodata": 0 }
-}
-```
+Spatial arrays MAY repeat `crs` and `transform` aliases, but these MUST agree with P/S when present, and readers MUST NOT require them. Writers SHOULD emit `_CRS` on data/mask/coverage for GDAL versions below 3.13, with `{"url":"http://www.opengis.net/def/crs/EPSG/0/<code>"}` and an optional matching string `wkt`. Readers MUST NOT require `_CRS`; if present it MUST agree with `proj:code`. The reader spike found that GDAL 3.13.3 recognizes the canonical CRS without this alias, but its native subdataset/overview discovery is not the chronozarr reader contract (§9).
 
-Shard objects: `0/data/c/{0,1}/0/{0,1}/{0,1}` (8 objects). Timesteps 0 to 3 are in time shard 0 (inner position `t`), timestep 4 is in time shard 1 at inner position 0. Shard `c/1/0/r/c` holds one timestep, but its index still has `shard_time = 4` entries (16 x 4 + 4 = 68 bytes), three of them empty. Shards at `r=1` hold rows 512..699 plus 324 rows of fill; shards at `c=1` hold columns 512..599 plus 424 columns of fill.
+### 3.4 Mirrors and validation
 
-`0/mask/zarr.json` (`coverage` differs only by name and `_ARRAY_DIMENSIONS` is identical):
+Readers MUST use the available `times`, `band_names` and `levels` mirrors as primary request-saving sources and MUST NOT require coordinate-array reads to obtain the same information. A validator MUST check mirror/source agreement. Disagreement is an error, not permission to silently replace authoritative P/S metadata.
 
-```json
-{
-  "zarr_format": 3,
-  "node_type": "array",
-  "shape": [5, 700, 600],
-  "data_type": "uint8",
-  "chunk_grid": { "name": "regular", "configuration": { "chunk_shape": [4, 512, 512] } },
-  "chunk_key_encoding": { "name": "default", "configuration": { "separator": "/" } },
-  "fill_value": 0,
-  "codecs": [{
-    "name": "sharding_indexed",
-    "configuration": {
-      "chunk_shape": [1, 512, 512],
-      "codecs": [{ "name": "bytes" }, { "name": "zstd", "configuration": { "level": 5, "checksum": false } }],
-      "index_codecs": [{ "name": "bytes", "configuration": { "endian": "little" } }, { "name": "crc32c" }],
-      "index_location": "end"
-    }
-  }],
-  "dimension_names": ["time", "y", "x"],
-  "attributes": { "_ARRAY_DIMENSIONS": ["time", "y", "x"] }
-}
-```
+`times[i]` MUST render the exact epoch-ms coordinate value; `band_names[i]` MUST equal `bands[i].name` and, for string band coordinates, `band[i]`. The levels mirror MUST contain one entry per M layout entry, in the same order:
 
-Shard objects: `0/mask/c/{0,1}/{0,1}/{0,1}` (8 objects), `0/coverage/c/{0,1}/{0,1}/{0,1}` (8 objects).
+| Field | Type | Equality rule |
+|---|---|---|
+| `path` | string | MUST equal the corresponding `multiscales.layout[].asset` group path. |
+| `resolution` | number | MUST equal the level group value and canonical horizontal pixel scale. |
+| `transform` | number[6] | MUST equal the level-group mirror and canonical S transform. |
+| `shape` | integer[4] | MUST equal the data array shape `[n_time,n_band,H_k,W_k]`. |
+| `grid` | integer[2] | MUST equal `[ceil(H_k/cs),ceil(W_k/cs)]`. |
 
-`1/zarr.json` has `"transform": [20.0, 0.0, 746090.0, 0.0, -20.0, 2540440.0]`, `"resolution": 20.0`. Level 1 arrays differ from level 0 only in `shape` (`[5, 2, 350, 300]`, `[5, 350, 300]`). Shard objects: `1/data/c/{0,1}/0/0/0`, `1/mask/c/{0,1}/0/0`, `1/coverage/c/{0,1}/0/0`.
+Writers MUST emit the mirrors specified above. Their reader fallbacks in §§3.2 and 9.2 support discovery of baseline values without inventing a legacy parser. A validator MUST distinguish a missing required writer field from a decodable fallback path.
 
-`0/time/zarr.json`:
+## 4. Validity, units and provenance
 
-```json
-{
-  "zarr_format": 3, "node_type": "array", "shape": [5], "data_type": "int64", "fill_value": 0,
-  "chunk_grid": { "name": "regular", "configuration": { "chunk_shape": [5] } },
-  "chunk_key_encoding": { "name": "default", "configuration": { "separator": "/" } },
-  "codecs": [{ "name": "bytes", "configuration": { "endian": "little" } }, { "name": "zstd", "configuration": { "level": 5, "checksum": false } }],
-  "dimension_names": ["time"],
-  "attributes": { "_ARRAY_DIMENSIONS": ["time"], "units": "milliseconds since 1970-01-01T00:00:00", "calendar": "proleptic_gregorian" }
-}
-```
+### 4.1 Dtype, nodata and fill
 
-`0/time/c/0` decodes to `[1704067200000, 1706745600000, 1709251200000, 1711929600000, 1714521600000]`. `band`, `x` and `y` follow the same pattern with `data_type` `string` (codec `vlen-utf8`) or `int32`, `float64` and `float64` respectively. `volatility/zarr.json`: `shape [2, 2]`, `data_type "float32"`, `chunk_shape [2, 2]`, `fill_value 0.0`, `dimension_names ["row", "col"]`.
+| Data dtype | Allowed `nodata` | Writer default | Overview arithmetic |
+|---|---|---|---|
+| `uint8` | Integer 0–255, or null | 0 | Integer (§5). |
+| `uint16` | Integer 0–65535, or null | 0 | Integer (§5). |
+| `int16` | Representable integer, or null | null | Integer (§5). |
+| `float32` | Finite representable number, or null | null | Float (§5). |
 
-A `none` store differs in the `temporal` block only (`{ "encoding": "none" }`, optionally with `selection`); the arrays, layout and every other attribute are the same.
+`chronozarr.nodata` MUST be one number or null. Null declares no nodata sentinel. If it is a number, it MUST equal each data array's `fill_value` and `nodata` attribute. If it is null, `fill_value` MUST be 0 and the data array's `nodata` attribute MUST be absent. NaN MUST NOT be used as nodata. Writers SHOULD NOT store NaN data; gaps SHOULD be marked using the sentinel or mask.
 
-## 4. Temporal encoding
+A pixel is valid when its mask exists and equals 1; otherwise, if there is no mask and a numeric nodata sentinel exists, when its data value differs from that sentinel; otherwise it is valid. A reader with a mask MUST use it and MUST NOT also compare data to the nodata sentinel. Invalid pixels MUST be treated as missing in band math, statistics, block means and charts. Where mask equals 0 the data value is not interpreted, and writers SHOULD store `fill_value` there. A missing optional mask does not make the store invalid; it changes which of these validity rules applies.
 
-### 4.1 `temporal` block
+### 4.2 Mask
+
+A writer MAY supply `{level}/mask`, but MUST supply it at every level or at none. The root declaration follows §3.2. Every mask MUST contain true `uint8` values 0 (invalid) or 1 (valid), with shape `[n_time,H_k,W_k]`, dimensions `["time","y","x"]`, matching `_ARRAY_DIMENSIONS`, and `fill_value: 0`.
+
+Mask chunks MUST follow the data layout without the band axis: unsharded `[1,cs,cs]`, keys `c/{t}/{r}/{c}`; sharded `[shard_time,cs,cs]` with inner chunks `[1,cs,cs]`, keys `c/{ts}/{r}/{c}`. The declared spatial metadata and codec chain MUST follow §§3.3 and 7. A coarser mask MUST be the maximum over each padded 2×2 source block (1 if any source pixel is valid), with edge replication as in §5.
+
+### 4.3 Coverage
+
+A writer MAY supply `{level}/coverage`, but MUST supply it at every level or at none. Its declaration follows §3.2. Every coverage array MUST use `uint8`, shape `[n_time,H_k,W_k]`, dimensions `["time","y","x"]`, matching `_ARRAY_DIMENSIONS`, and `fill_value: 0`. Its layout, chunk sizes, keys, spatial metadata and codec chain MUST match the mask rules, whether or not a mask exists.
+
+Level-0 coverage MUST represent the number of valid observations behind a pixel, saturated at 255. Zero denotes a pixel that was gap-filled or never observed. At a coarser level it MUST be the mean of the four edge-replicated source values, rounded to nearest integer with halves up: `(sum + 2) // 4`. Coarser values are rounded summaries, not literal independent observation counts. Coverage MUST NOT replace the mask or sentinel validity rule: a gap-filled pixel can be valid with coverage 0. Gap-fill provenance follows §4.5.
+
+### 4.4 Band descriptions and physical values
+
+Each `chronozarr.bands` entry MUST be an object. String-only descriptions and source-specific scale inference are outside this profile.
 
 | Field | Type | Rule |
 |---|---|---|
-| `encoding` | string | `"none"` or `"star-delta"`. Readers MUST support both. |
-| `anchor_interval` | int >= 1 | `star-delta` only. Timesteps between anchors. `1` means every timestep is an anchor (no deltas). |
-| `anchor_indices` | int[] | `star-delta` only. `[0, k, 2k, ...]` for `k = anchor_interval`, `< n_time`. |
-| `delta_reference` | object | `star-delta` only. Key: non-anchor timestep index as a decimal string (JSON object keys). Value: the anchor index it references (§4.2), at index distance `d` with `0 < d < anchor_interval`. Every non-anchor index MUST appear and no anchor may. |
-| `selection` | object | Optional. `{ "mode": "auto", "sampled_cells": int, "ratio": number }`, written only when the writer chose the encoding by measurement (§4.3). |
+| `name` | string | MUST be unique within the store and equal the string coordinate value where band coordinates hold names. |
+| `common_name` | string | MAY be supplied; SHOULD use the applicable STAC `eo:bands` vocabulary, e.g. red, green, blue, nir, swir16 or swir22. |
+| `scale` | number | MAY be supplied; default 1. Writers SHOULD write it explicitly. |
+| `offset` | number | MAY be supplied; default 0. Writers SHOULD write it explicitly. |
+| `units` | string | MAY be supplied; free text, e.g. `"reflectance"` or `"fraction"`. |
 
-With `"none"`, the data array holds true values and readers do nothing beyond §10. `anchor_interval`, `anchor_indices` and `delta_reference` MUST be absent. `star-delta` is valid only for `uint8` and `uint16` data (§2.3).
+Physical value is `stored * scale + offset`. Consumers MUST apply that formula whenever valid physical values are shown or combined; invalid pixels MUST remain missing and MUST NOT be scaled into valid measurements. Consumers doing band math or indices SHOULD select by `common_name`, falling back to `name`, and MUST NOT assume a source's reflectance scale. An RGB uint8 band with scale 1 is interpreted in its stored units.
 
-### 4.2 Star-delta
+Writers MUST NOT set CF `scale_factor` or `add_offset` on data arrays to silently trigger automatic scaling by generic clients. Generic readers see stored values; conversion to physical units is an explicit consumer operation. The CF time units in §2.2 are independent of this band-value rule.
 
-Applies identically at every level.
+### 4.5 Provenance
 
-1. **Anchor indices:** `[0, anchor_interval, 2*anchor_interval, ...]` while `< n_time`.
-2. **Delta reference:** each non-anchor timestep references one anchor, recorded in `delta_reference`. A reference is valid when it names an anchor at index distance `d` with `0 < d < anchor_interval`; readers MUST decode through the recorded map and MUST NOT recompute it. A writer SHOULD reference the nearest anchor by absolute index distance, ties toward the earlier anchor, among the anchors that exist when it writes the timestep: a fresh encode considers every anchor `< n_time`, an append the anchors that exist after the append, including those in the appended batch. A writer MUST NOT change the reference of a timestep that is already written. Caches and open readers hold its bytes, and a changed reference would change what those bytes decode to (§14). The nearest-anchor rule is therefore the default for new timesteps (it gives the smallest residuals), not a validity condition.
-3. **Anchor storage:** `data[t] = source[t]` (true values).
-4. **Delta storage:** `data[t] = (source[t] - source[a]) mod 2^bits`, where `a` is the reference anchor and `bits` is 8 or 16: unsigned wraparound subtraction in the stored dtype.
+A writer MAY supply `chronozarr.provenance`. When present it MUST contain:
 
-Anchors and deltas live in the same array. There is no clipping, no range check and no failure mode: modular arithmetic reconstructs every input exactly, so Invariant 1 holds for every input. When `|source[t] - source[a]| < 2^(bits-1)` the stored bits equal the two's-complement signed difference, which is what v0.1 stored for `uint16` (int16 residuals viewed as uint16); every v0.1 star-delta store is therefore also a valid v0.2 store.
+| Field | Type | Rule |
+|---|---|---|
+| `sources` | string[] | Required; collection identifiers or input-data URLs. |
+| `composite` | string | Required; temporal-composite description, e.g. `"monthly median"`. |
+| `gap_fill` | string | Required; `"none"` or `"carry-forward"`. Carry-forward means a pixel with no valid observation takes the previous timestep's value. |
+| `notes` | string | Optional additional explanation. |
 
-Decoding:
+Provenance MUST describe the processing actually applied. It does not override validity or coverage interpretation.
 
-```
-if encoding == "none" or t in anchor_indices:
-    return data[t]                                   # true values, use directly
-else:
-    anchor_t = delta_reference[str(t)]
-    return (data[anchor_t] + data[t]) mod 2^bits     # unsigned wraparound in the stored dtype
-```
+## 5. Overview semantics
 
-Readers MUST NOT clamp. A residual is not special-cased for `nodata`: the stored residual of a nodata pixel is `(nodata - anchor) mod 2^bits`, and reconstruction returns `nodata` exactly.
+Level 0 MUST retain native-resolution stored values. Each level `k>0` MUST be derived from level `k-1` by a factor-two block mean of true values, excluding invalid pixels under §4.1. A block with no valid pixels MUST produce the declared nodata value, or 0 if nodata is null.
 
-**Why star, not chain.** Chain-delta (each timestep references the previous) gives roughly 10-15% better compression but requires sequential decoding. Star-delta gives O(1) random access to any timestep, which is what scrubbing needs.
+Before reduction, the source MUST be padded to an even height and width by edge replication, including the validity and coverage planes. Thus `H_k = ceil(H_{k-1}/2) = ceil(H_0/2^k)` and similarly for width. The origin MUST remain fixed and ground sample distance MUST double at each level (§3.3).
 
-### 4.3 Writer selection
+For uint8, uint16 and int16, writers MUST compute the exact sum in a wider integer type (uint32 or int32 as appropriate), divide by the valid-pixel count using floor division, and store the result in the unchanged data dtype. Float32 means MUST accumulate in float64 and be stored as float32. Masks and coverage MUST reduce as in §§4.2–4.3. No other overview resampling method is part of this profile.
 
-The writer option `encoding` takes `auto` (default), `none` or `star-delta`.
+The spatial chunk size MUST stay constant; only array shape and cell grid shrink. Levels MUST be consecutive from 0. The default writer MUST stop at the first level whose cell grid is 1×1, including that level; a writer MAY explicitly choose fewer or more levels.
 
-- `auto` applies to `uint8` and `uint16` only. For `int16` and `float32` the writer uses `none` and writes no `selection`.
-- `auto` encodes a sample of LOD 0 cells both ways with the codec the store will use, at least 3 cells or all cells when there are fewer, and keeps `star-delta` only if its total compressed bytes are at most 0.85 times the plain total. It records `selection = { "mode": "auto", "sampled_cells": n, "ratio": r }`, where `r` is star-delta compressed bytes divided by plain compressed bytes over the sampled cells.
-- `none` and `star-delta` MAY be forced; a forced choice writes no `selection`.
-- Basis for the threshold: star-delta reduced compressed size by about 25% on arid scenes and about 6% on vegetated scenes (2026-09-30). A plain store reads correctly in xarray and zarrita without an adapter, and in zarr-layer too when it carries no `pixels_per_tile` (§3.4, §12), so the extra decode path is worth carrying only where the saving is material.
+**Categorical and binary guidance.** Integer block means do not preserve categorical classes or binary shares: a 2×2 block with three integer 1s and one 0 becomes 0 under floor division. A binary quantity SHOULD be stored as a scaled fraction, e.g. 0/10000 with scale 1e-4 and units `"fraction"`, so the coarse stored value represents the flagged share. Class codes have no meaningful arithmetic mean. A writer requiring majority/nearest categorical overviews must prepare a separately described product; it MUST NOT advertise such a pyramid as this profile's average pyramid. The default mean and its limitations MUST NOT be silently replaced by a categorical rule.
 
-## 5. Volatility
+## 6. Volatility
 
-A float32 array at `volatility_path` (`volatility`) in the root group, shape `(grid_rows_0, grid_cols_0)`, one value per LOD 0 cell, single chunk.
+A store MAY include the root array `volatility`, declared only through `chronozarr.volatility_path`. Its absence is conforming and MUST NOT prevent decoding or scientific interpretation of data. When present, it MUST use true float32 values, shape `[grid_rows_0,grid_cols_0]`, dimensions `["row","col"]` with matching `_ARRAY_DIMENSIONS`, and one chunk covering that shape. It is a cell-ordering metric, not a georeferenced pixel array, and MUST NOT declare S.
 
-```
-volatility[r, c] = clip( mean(|source[t] - source[ref(t)]|
-                              over all non-anchor t, all bands, all pixels of cell (r, c))
-                         / 10000 , 0, 1)
-```
-
-- `ref(t)` is `delta_reference[t]` for `star-delta` stores. For `none` stores the writer evaluates the same expression against a nominal nearest-anchor schedule (anchor interval chosen by the writer, default 6); that schedule is not recorded and readers MUST NOT depend on it beyond ordering.
-- Computed on exact differences (int32 for integer dtypes, float64 for `float32`), over all pixels including invalid ones, at LOD 0 only.
-- `0.0` when the cell has no delta timesteps (`anchor_interval = 1` or `n_time = 1`).
-- The divisor 10000 is a fixed normalization constant for every dtype (it is the Sentinel-2 reflectance scale). It is not a physical unit; for other sources the value is still monotone in temporal change.
-
-Readers use it to order prefetch (volatile cells first) and to draw change overviews. A store without it is decodable but not conforming.
-
-## 6. Multiscale pyramid
-
-Each level halves pixel dimensions and doubles ground sample distance by block averaging that excludes invalid pixels (§2.3). A block whose pixels are all invalid yields `nodata` (`0` when `nodata` is `null`).
-
-- Level 0: native resolution (10 m for Sentinel-2). Level `k`: resolution `* 2^k`.
-- Level `k` is derived from level `k-1` by a factor-2 block mean. Before averaging, the source is padded to an even height and width by edge replication, so `H_k = ceil(H_{k-1} / 2) = ceil(H_0 / 2^k)`, same for `W`.
-- The mean of integer dtypes (`uint8`, `uint16`, `int16`) is computed on the exact sum in a wider integer type (`uint32` or `int32`) with floor division by the valid-pixel count, and stored in the data dtype. The mean of `float32` accumulates in float64 and is stored as float32.
-- `mask` reduces by maximum and `coverage` by rounded mean (§2.4, §2.5).
-- Downsampling is applied to source timesteps; star-delta is then applied per level. Deltas are never downsampled.
-- **Chunk size stays constant.** Only the grid shrinks: `grid_rows_k = ceil(H_k / cs)`.
-- Levels MUST be consecutive from 0. The encoder default stops at the first level whose grid is 1 x 1 (that level is included). Fewer or more levels MAY be present.
-
-**Categorical and binary bands.** Coarser levels are block means. That is correct for continuous quantities and for fractions, and wrong for a class code or a 0/1 flag stored as the integers 0 and 1: an integer mean floors, so a block with 3 of 4 pixels set becomes 0, and the flagged share shrinks with every level (a water flag fell from 12.1 % at level 0 to 8.5 % at level 3 in one test). A binary band SHOULD be stored as a scaled fraction, for example 0 or 10000 with `scale` 1e-4 and `units` `"fraction"` (§3.6), so that each coarse value is the fraction of the block that is set and a reader can threshold it. A categorical band has no meaningful mean at all. A writer that needs true categorical overviews must downsample them itself, with a class rule such as majority or nearest, before calling the encoder; the encoder always builds its pyramid by block mean, so each such overview is a store of its own.
-
-## 7. Sharding
-
-### 7.1 Layout
-
-**Default: unsharded.** Each chunk `(1, n_band, cs, cs)` is its own object, key `c/{t}/0/{r}/{c}`: one object per timestep, cell and level (about 5,900 for a 117-month store of 36 level-0 cells). A timestep of a cell is one `GET` of one object, two for a `star-delta` delta timestep. There is no index to read, a CDN miss costs one chunk, and an append writes only new objects (§14).
-
-**Option: sharded.** The array uses the `sharding_indexed` codec with shard shape `(shard_time, n_band, cs, cs)` and inner chunk shape `(1, n_band, cs, cs)`. A shard object holds one spatial cell over `shard_time` consecutive timesteps (93 objects for the same store), and once its index is cached one timestep is one HTTP byte-range read. The index is a separate read at the end of an object that can be tens or hundreds of megabytes, and a CDN that fetches the whole object from the origin on a miss makes that read as slow as the object is large, so the cost of a cold read grows with the shard size (§13 gives the measurement). An append rewrites the shard that receives the new timestep (§14). Zarrita 0.7.5 read sharded stores over byte ranges with bytes transferred equal to the unsharded store and bit-exact reconstruction (spike, 2026-09-29).
-
-A sharded array:
-
-```json
-"chunk_grid": { "name": "regular", "configuration": { "chunk_shape": [4, 2, 512, 512] } },
-"codecs": [{
-  "name": "sharding_indexed",
-  "configuration": {
-    "chunk_shape": [1, 2, 512, 512],
-    "codecs": [{ "name": "bytes", "configuration": { "endian": "little" } }, { "name": "zstd", "configuration": { "level": 5, "checksum": false } }],
-    "index_codecs": [{ "name": "bytes", "configuration": { "endian": "little" } }, { "name": "crc32c" }],
-    "index_location": "end"
-  }
-}]
-```
-
-- In Zarr v3 terms the array's `chunk_grid.chunk_shape` is the **shard** shape and the codec's `chunk_shape` is the **inner chunk** shape. Inner chunks are the same bytes an unsharded store would hold as separate objects.
-- **`shard_time`** is an integer `>= 1`; the writer default, when sharding is asked for, is `n_time` (one shard holds a cell's whole time axis). It MAY exceed `n_time`: the array then holds one partial shard, which a later append (§14) fills. The time grid has `n_shards_t = ceil(n_time / shard_time)` shards, so the shard grid of the data array is `(n_shards_t, 1, rows, cols)`. Readers MUST handle more than one shard along time.
-- Timestep `t` lives in time shard `ts = floor(t / shard_time)` at inner position `t mod shard_time`. The shard key is `c/{ts}/0/{r}/{c}`. When `shard_time = n_time`, `ts` is always 0 and the keys are `c/0/0/{r}/{c}`, as in v0.1. `mask` and `coverage` have no band axis: shard shape `(shard_time, cs, cs)`, key `c/{ts}/{r}/{c}`.
-- Objects per level drop from `n_time * grid_rows * grid_cols` to `n_shards_t * grid_rows * grid_cols`.
-- The writer SHOULD choose `shard_time` so that no shard object exceeds the largest object the intended host or CDN will cache or range-serve, and so that a miss on one shard is tolerable (a CDN that pulls the whole object for a small range read charges the shard's size for its 2 KB index). For `star-delta` stores it SHOULD choose a multiple of `anchor_interval`.
-- **Both forms are valid.** A reader MUST handle both; it learns which from the `codecs` list. Every store written with the earlier sharded default stays valid. Unsharded (§2.1) also works on hosts without byte-range support.
-
-### 7.2 Shard index
-
-- The index holds one `(offset, nbytes)` uint64 pair per inner chunk of the shard: `16 * shard_time` bytes plus 4 bytes crc32c, `N = 16 * shard_time + 4`. A partial last time shard is stored at full shard shape: its index still has `shard_time` entries, and entries for timesteps `>= n_time` are empty.
-- With `index_location: "end"` a reader fetches the index with the last `N` bytes of the shard; with `"start"`, the first `N` bytes. Readers MUST support both. Writers SHOULD use `"end"`: zarrita 0.7.5 ignores `index_location` and decodes start-indexed shards as garbage without error, which would break every stock zarrita reader including CarbonPlan zarr-layer.
-- Without `shard_bytes` (§7.3), a reader fetches the end-located index with a suffix range (`Range: bytes=-N`, which triggers a CORS preflight) or learns the object length with a `HEAD` first. Zarrita issues one `HEAD` before the index read, so a cold cell costs `HEAD`, index, chunk, then one range per timestep.
-- Readers MUST cache the index per shard and reuse one array handle per level (zarrita caches the index per array instance).
-- Empty inner chunks (both index values `2^64 - 1`) decode as all `fill_value`. A shard object that does not exist (`404`) is an entirely empty shard, and readers MUST decode it as all `fill_value`; writers MAY omit shards that are entirely fill.
-
-### 7.3 `shard_bytes`
-
-Optional root attribute `chronozarr.shard_bytes`, sharded stores only, covering the data array (not `mask` or `coverage`):
+The existing nominal comparison policy is retained solely for this metric. The publisher chooses a positive integer comparison interval `s`, default 6. Let `C={0,s,2s,…}` restricted to indices below `n_time`; let `D` be the other timestep indices. For each `t` in D, `q(t)` is the closest index in C by absolute index distance, with ties toward the earlier index. The comparison policy is independent of storage, is not a decoding instruction, and need not be recorded. Readers MUST NOT require it to decode data or use the stored metric for ordering.
 
 ```text
-{ "<level path>": { "<t_shard>/<row>/<col>": <byte length of that shard object> } }
+volatility[r,c] = clip(
+    mean(abs(source[t] - source[q(t)])
+         over t in D, all bands and all source pixels of level-0 cell (r,c)) / 10000,
+    0, 1)
 ```
 
-- It lists exactly the shard objects of the data array that exist, for every level.
-- With the length of an end-located shard known, a reader issues the index read as the bounded range `bytes=(L-N)-(L-1)`, needing no `HEAD` and no preflight. Readers MUST use `shard_bytes` when present and MUST fall back to a `HEAD` for any shard it does not list.
-- Because shard objects are immutable (§9), the lengths cannot go stale, with one exception: an append (§14) replaces the shard that receives a new timestep, and its listed length changes with it.
+When written, this value MUST be computed from exact differences: int32 for integer data and float64 for float32 data. The mean MUST include invalid source pixels, as in the existing publisher metric, and MUST use level 0 only. It MUST be 0 if D is empty, including `s=1` or `n_time=1`; an all-zero mean likewise yields 0. Results MUST be clipped to [0,1] and stored as float32. The divisor 10000 is fixed for every dtype; it reflects the original reflectance normalization and is not a physical unit. For other sources it remains a relative temporal-change metric, not a calibrated change magnitude.
 
-### 7.4 Star-delta across shards
+Readers MAY use volatility to order prefetch or draw change overviews. They MUST distinguish optional metric availability from data decodability. A present array that violates this definition is a conformance error, whereas an absent array is not.
 
-A non-anchor timestep and its reference anchor can sit in different time shards (for example the last timesteps before a shard boundary whose nearest anchor is the first timestep of the next shard). Such a read still touches two chunks (Invariant 2) but two shards, so a cold read also pays the second shard's index. Choosing `shard_time` as a multiple of `anchor_interval` keeps almost every delta and its anchor in one shard.
+## 7. Storage interoperability restrictions
 
-## 8. Compression codec
+### 7.1 Unsharded default and optional time sharding
 
-| Codec | Status | Configuration |
-|---|---|---|
-| `zstd` | Default | `{ "level": 5, "checksum": false }` |
-| `blosc` | Permitted | `cname` `zstd` or `lz4`; `shuffle` `noshuffle` or `shuffle`; `clevel` 0 to 9; `typesize` the element size in bytes of the data dtype; `blocksize` 0 |
-| `gzip` | Permitted | `{ "level": 1..9 }` |
+Writers MUST default to unsharded data, mask and coverage arrays. A writer MAY explicitly choose indexed time sharding. Readers MUST support both forms and determine the form from the codecs, not a filename assumption. Unsharded objects and cells follow §§2.1 and 4; a timestep of a cell costs one object GET and no index read.
 
-- Readers MUST support all three, including both `cname` values and both `shuffle` values of `blosc`. Writers MUST use exactly one, preceded by `bytes` little-endian.
-- Other codecs, other `blosc` `cname` values and `shuffle: "bitshuffle"` MUST NOT be used: the browser reader carries no WASM dependency for them.
-- The same codec chain applies to `data`, `mask` and `coverage`; the `time`, `band`, `x`, `y` and `volatility` arrays MAY use any of the three.
+A sharded data array MUST select `sharding_indexed` with shard shape `[shard_time,n_band,cs,cs]` and inner shape `[1,n_band,cs,cs]`. Mask and coverage shard shapes MUST be `[shard_time,cs,cs]`, inner shapes `[1,cs,cs]`, using the same positive integer `shard_time`. Sharding index and empty-chunk semantics are inherited from I (§0.2).
 
-Rationale: size and browser decode speed were measured, not assumed. On one real Sentinel-2 chunk (4 x 512 x 512 uint16, 2,097,152 bytes, median of 15 in Chromium, 2026-09-29) zstd via the numcodecs-js WASM codec that zarrita uses decoded in 4.5 ms at 1,284,781 bytes, native gzip via `DecompressionStream` in 6.7 ms at 1,387,409 bytes, and zstd via the pure-JS fzstd in 14.1 ms. On four real Ucayali LOD 0 chunks of 2,097,152 bytes (zarrita 0.7.5 with vendored codec modules served locally, headless Chrome, median of 20, 2026-09-30), zstd level 5 stored 1,376,469 bytes and `blosc` with zstd level 1 and byte shuffle stored 1,520,154 bytes, 10.4% more. Steady-state decode took 4.4 ms for zstd and 3.5 ms for `blosc` (4.4 and 3.3 ms inside a worker), and every reconstruction was bit-exact. Byte shuffle did not reduce the size of the zstd stream on this data. The 10.4% size penalty alone decides the default: zstd level 5 stores the fewest bytes, and the decode difference is about 1 ms per chunk. `blosc` stays permitted for writers that prefer encode speed or a faster steady-state decode, and `gzip` for writers without a zstd implementation. Encode cost is irrelevant to the default.
+`shard_time` MUST be an integer at least 1. When sharding is explicitly chosen, the default `shard_time` is `n_time` at creation. It MAY exceed `n_time`; partial time shards follow I. The number of time shards is `ceil(n_time/shard_time)`. Readers MUST handle multiple time shards. A writer MUST NOT accept a `shard_time` option without enabling sharding.
 
-## 9. Static hosting requirements
+Timestep `t` belongs to time shard `ts=floor(t/shard_time)` at inner timestep `t mod shard_time`. The data shard key is `c/{ts}/0/{r}/{c}`, and the plane key is `c/{ts}/{r}/{c}`. There is one shard object per time shard and spatial cell per level and variable; the data band grid remains one. Readers MUST derive the shapes and mapping from the regular grid and I configuration.
 
-A chronozarr store is served by any HTTP server or object store that returns files by path. No server-side code. Host recipes and a header checklist are in `docs/hosting.md`.
+A writer SHOULD choose `shard_time` so no object exceeds the intended host/CDN cache or range-serving limit, and a whole-object miss is tolerable. A CDN may retrieve a whole large shard for a small index range. For appendable stores, unsharded storage SHOULD be used; if object count justifies sharding, writers SHOULD choose a finite interval, e.g. 12 for monthly data, instead of automatically using an entire long archive. Whole-axis sharding is appropriate for archives that will not be appended. An append rewrites the shard receiving new timesteps (§8.3).
 
-| Requirement | Level |
+### 7.2 Index access, cache and byte-length hints
+
+The index representation, checksum, placement semantics and missing/empty chunk rules are those of I, Index / Index location / Empty chunks (§0.2). Writers SHOULD use `index_location: "end"` for tested browser interoperability. Readers MUST support both upstream index locations, MUST cache indices per shard and MUST reuse one array handle per level rather than defeat an implementation's per-array index cache.
+
+`chronozarr.shard_bytes` MAY inventory existing data-array shard objects (not mask/coverage), using:
+
+```text
+{ "<level group path>": { "<t_shard>/<row>/<col>": <exact object byte length> } }
+```
+
+When supplied, the inventory MUST list exactly the data shards that exist at every level, with exact lengths for the published metadata snapshot. A reader MUST use a listed length for a bounded index range and MUST fall back to HEAD to learn the length of an unlisted shard. Given object length L and index length N determined under I, an end-index bounded request is `Range: bytes=(L-N)-(L-1)`. Without a listed length, suffix-range access or the HEAD fallback follows the host's capabilities; the required HEAD fallback MUST remain available. Missing objects follow I's empty-chunk rules, not an invented sentinel representation.
+
+Lengths MUST be updated when append rewrites an object; they are not universally immutable. An unchanged shard retains its length. Snapshot recovery for a replaced trailing shard is specified in §8.4.
+
+### 7.3 Codec subset
+
+Codec algorithms, configuration semantics and binary representations follow [bytes](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/bytes/), [zstd](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/zstd/), [gzip](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/gzip/) and [blosc](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/blosc/). This profile restricts the choices:
+
+| Compressor | Profile configuration |
 |---|---|
-| `GET {store}/{key}` returns the object bytes; an absent key returns `404` (not a fallback page with `200`) | MUST |
-| `Range` requests honoured with `206 Partial Content` and `Content-Range` (needed for sharded stores; an unsharded store, the writer default, needs only GET) | MUST for sharded |
-| Chunk and shard objects served as stored: no `Content-Encoding` or other transformation, so byte offsets match the shard index | MUST |
-| `Access-Control-Allow-Origin: *` | MUST |
-| `Access-Control-Allow-Headers: Range` (or `*`) and a `200`/`204` answer to `OPTIONS` preflight | SHOULD |
-| `Access-Control-Expose-Headers: Content-Range, Content-Length` | SHOULD |
-| `Cache-Control: public, max-age=31536000, immutable` | SHOULD |
-| `Timing-Allow-Origin: *` | MAY |
+| `zstd` | Default: level 5, checksum false. |
+| `blosc` | `cname` MUST be zstd or lz4; `shuffle` MUST be noshuffle or shuffle; `clevel` MUST be 0–9; `typesize` MUST equal the array element size in bytes; `blocksize` MUST be 0. |
+| `gzip` | Level MUST be 1–9. |
 
-- Browsers do not preflight a bounded `Range: bytes=a-b`; only suffix ranges `bytes=-N` trigger one. A reader that uses `shard_bytes` (§7.3) issues only bounded ranges.
-- Without `Timing-Allow-Origin`, `PerformanceResourceTiming.transferSize` is 0 for cross-origin requests, so a reader can count bytes only from `Content-Length`.
-- Stores are treated as immutable. A re-encode MUST be written under a new prefix, never in place. The one in-place change is an append (§14), which leaves every existing chunk's meaning unchanged and replaces only the objects §14 lists.
-- Upload order SHOULD be: all chunk and shard objects, then group and array `zarr.json` below the root, then the root `zarr.json` last. A reader treats the root `zarr.json` as the marker that the store exists, so it never describes missing data.
-- Zarr v3 metadata is `zarr.json`, never a dotfile, so hosts that hide dotfiles (GitHub Pages, some CDNs) serve a store correctly. No `.zarray`, `.zattrs` or `.zmetadata` exist.
-- Directory listing is never required (a reader derives every key from metadata) and object content types are ignored.
+Readers MUST support all three compressors, including both allowed blosc compression and shuffle variants. Writers MUST use exactly one supported compressor preceded by the bytes codec with little-endian configuration for numeric arrays; byte-order exceptions for one-byte dtypes follow B (§0.2). For string band coordinates, the standard Zarr `vlen-utf8` array-to-bytes codec replaces numeric bytes serialization, followed by a supported compressor. This required string representation is not another permitted numeric compressor.
 
-## 10. Reader requirements
+Other compression codecs, other blosc `cname` values, and `shuffle: "bitshuffle"` MUST NOT be used. The data, mask and coverage arrays MUST use the same codec chain, apart from element-size/byte-order differences required by their dtypes and the surrounding sharding configuration. Coordinates and optional volatility MAY independently choose any of the three supported compressors. Readers MUST report unsupported data types or codecs by name (§9.2).
 
-A conforming reader MUST:
+## 8. Static publishing and append
 
-1. `GET {store}/zarr.json`. Reject the store if `attributes.chronozarr.spec_version` is not `0.1.x` or `0.2.x`, or if `temporal.encoding` is not `"none"` or `"star-delta"` (a v0.1 store is `star-delta`). Take timestamps from `chronozarr.times`, band objects from `chronozarr.bands` (strings read as `{ name }`), the data array name from `chronozarr.variable`, and the validity rule inputs from `chronozarr.nodata`, `mask_variable` and `coverage_variable`.
-2. Enumerate levels from `chronozarr.levels` when present; otherwise from `multiscales[0].datasets[].path`, reading each level's `zarr.json` (`transform`, `resolution`). Read `{variable}/zarr.json` (`shape`, `data_type`, `chunk_grid`, `codecs`; `cs` is the spatial inner chunk size, §2.1) for each level, or take them from consolidated metadata when present. Fail with an error naming any unsupported `data_type` or codec.
-3. Select a level: the largest `k` whose `resolution` does not exceed the requested output ground sample distance; `k = 0` if none.
-4. For timestep `t` and cell `(r, c)`: under `none`, or when `t` is in `anchor_indices`, read one chunk. Otherwise read the chunk at `delta_reference[str(t)]` and the chunk at `t`. Never more than two reads (Invariant 2).
-5. Reconstruct per §4.2: unsigned wraparound add in the stored dtype, no clamp. Discard elements beyond `shape` (§2.1).
-6. For sharded arrays, compute the shard and inner position from `shard_time` (§7.1), read the shard index (§7.2, using `shard_bytes` when present), then one byte range per inner chunk. Decode a missing shard as `fill_value`.
-7. Apply the validity rule (§2.3): invalid pixels are missing in band math and statistics. Read `{level}/mask` and `{level}/coverage` only when `mask_variable` and `coverage_variable` are present.
-8. Apply `scale` and `offset` (§3.6) wherever physical values are shown or combined.
+### 8.1 HTTP host contract
 
-A reader SHOULD cache decoded anchors and shard indices for the session, and SHOULD prefetch anchors before deltas: once every anchor in the viewport is resident, any timestep costs one delta read. Under `none` there are no deltas and prefetch order is free.
+Stores are served as objects by key from a static host; no application server is required. Z's node metadata representation applies by reference (§0.2).
 
-Reference implementations: the Python package `chronozarr` (`open_store(path_or_url)` returns a reader with `read(t)`, `read_cell(t, row, col)` and `to_xarray()`; `validate(store)` checks a store against this spec) and the JavaScript reader `js/chronozarr/decoder.js` (zarrita store, reconstruction, cache, prefetch), DOM-free so it runs in a Worker, under MapLibre, or on a bare canvas.
+| Host behavior | Requirement |
+|---|---|
+| GET of an existing key returns its object bytes; an absent key returns 404, not a 200 fallback page | MUST. |
+| Range requests return 206 Partial Content with Content-Range | MUST for sharded stores; unsharded stores require only GET. |
+| Chunk/shard bytes are served unchanged, with no Content-Encoding or other transformation | MUST. |
+| `Access-Control-Allow-Origin: *` | MUST. |
+| `Access-Control-Allow-Headers: Range` or `*`, and OPTIONS preflight answers 200/204 | SHOULD. |
+| `Access-Control-Expose-Headers: Content-Range, Content-Length` | SHOULD. |
+| `Cache-Control: public, max-age=31536000, immutable` on immutable objects | SHOULD; mutable append objects use §8.3. |
+| `Timing-Allow-Origin: *` | MAY. |
 
-A plain Zarr reader (`xarray.open_zarr(store, group="0")`, zarrita) reads a `none` store without this spec. For a `star-delta` store it reads anchor timesteps correctly and non-anchor timesteps as residuals.
+Bounded ranges avoid the suffix-range CORS preflight on tested browsers. Cross-origin transfer-size measurement without Timing-Allow-Origin may report zero, so consumers can use exposed Content-Length for byte accounting. Directory listing MUST NOT be required; consumers MUST derive keys from metadata and MUST NOT depend on object content types.
 
-## 11. What this is not
+### 8.2 Immutable publication
 
-- Not a new binary format. It is Zarr v3 with a layout convention.
-- Not a codec. Star-delta spans chunks, so it cannot sit in a Zarr `codecs` list; it lives in group attributes and the reader.
-- Not a video codec. Deltas are block-compressed arrays, not I/P/B frames.
-- Not a spatial index. A regular grid of chunks with a power-of-2 pyramid.
-- Not a server or an API. There is nothing to run; a bucket is the deployment.
-- Not a viewer. chronozarr is one consumer; zarr-layer and xarray are others.
+A re-encode MUST be written under a new prefix, never over an existing published store. The only permitted in-place growth is append under §§8.3–8.4, preserving old values.
 
-## 12. Relationship to prior art
+Initial upload order SHOULD be data/plane chunks and shards first, then metadata below the root, and root metadata last. The reader uses root metadata as the publication marker. Metadata-last publication does not make a multi-object update atomic and does not excuse incomplete working-copy validation.
 
-A row-by-row comparison with guidance on when to choose each tool is in `docs/format-comparison.md`.
+### 8.3 Append restrictions and writes
 
-- **PMTiles** (Protomaps): single-file archive of z/x/y tiles for static hosting. The hosting model (one bucket, range reads, no server) is the same. Tiles are images; per-tile values are whatever the image encoding carries, and there is no native time axis.
-- **Mapbox raster-array (MRT)**: multi-band numeric raster tiles with a time-like band dimension, decoded client-side. The decoder code is published in mapbox-gl-js (`src/data/mrt`); the format is produced by the Mapbox Tiling Service and consumed by Mapbox's renderer, so using it means using that service and renderer. chronozarr is a Zarr-based alternative that a static bucket serves.
-- **carbonplan ndpyramid + zarr-layer**: Zarr pyramids rendered in MapLibre with a time selector. chronozarr writes the same `multiscales` attribute and level/variable shape, without `pixels_per_tile`: zarr-layer reads that key as the marker of a global Web Mercator pyramid (§3.4). A `none` store written without it opens in zarr-layer 0.10.0 unmodified (verified on the Ucayali store at level 1; point values equal to a direct Zarr read, `docs/comparisons.md`). A store written earlier carries the key and opens with zarr-layer's `crs` and `bounds` constructor options. zarr-layer reads the `proj` and `spatial` attributes and supports arbitrary CRS through proj4 reprojection. A `star-delta` store needs an adapter that reconstructs the residuals before zarr-layer renders it; stock zarr-layer does not. chronozarr stores stay in a projected per-AOI CRS and declare it via `proj`/`spatial` attributes.
-- **GeoZarr** and the zarr-conventions `proj`/`spatial`/`multiscales` drafts: CRS and affine conventions chronozarr aligns with (`crs`, `transform`, `proj:code`, `spatial:*`). GeoZarr's multiscale layout is still a proposal. chronozarr adds the temporal block, the band objects, the `times`/`band_names`/`levels` mirrors, `mask`, `coverage` and the volatility array on top.
-- **COG + TiTiler**: single-timestep GeoTIFFs rendered by a tile server. It needs a running server and one request path per timestep; chronozarr needs neither.
+A store MAY grow only at the end of its time axis. New dates MUST be strictly after the previous final date, and MUST have compatible grid, bands (including units/scales/offsets), dtype, CRS and nodata. A store with a mask or coverage MUST receive that plane for every new timestep; a store without the plane MUST NOT acquire it through append. Existing grid geometry, level count, cell size, layout and codec configuration MUST remain compatible.
 
-## 13. Changes from 0.1
+The writer MUST construct an append in a working copy and validate it before publication. It MUST extend every level's data and declared mask/coverage shapes to the new `n_time`, rewrite the time coordinate as a single chunk of the new length, update `chronozarr.times`, `levels[].shape`, affected `shard_bytes`, array shapes and consolidated metadata when present. Optional volatility, if present, MUST be updated to satisfy §6 over the enlarged series; its absence does not require adding it. Each new overview timestep MUST be derived by the same §5 rules as a fresh encode. M layout and fixed geometry remain unchanged.
 
-- **Version.** `spec_version` is `0.2.0`. Readers accept `0.1.x` and `0.2.x`; every v0.1 store is a valid v0.2 store (its `bands` is a list of strings, it has no `levels`, `band_names`, `mask_variable` or `selection`, and its residual bytes are valid modular residuals). A v0.1-only reader rejects `0.2.x` stores at the version check; the `multiscales` attribute, `dimension_names` and plain arrays keep plain Zarr consumers working.
-- **Temporal encoding is optional** (§4). `temporal.encoding` is `none` or `star-delta`. The writer default `auto` measures a sample of LOD 0 cells and keeps star-delta only at 0.85 of the plain size or better, recording `temporal.selection`.
-- **Residuals are modular** (§4.2). The clip and the encoder's overflow failure are gone; decoders wrap instead of clamping. Bytes are identical to v0.1 wherever the difference fits the signed range. `uint8` joins `uint16` as a star-delta dtype.
-- **Codecs** (§8). Readers must support `zstd`, `gzip` and `blosc` (`cname` zstd or lz4, `shuffle` or `noshuffle`). The default stays `zstd` level 5.
-- **dtype and nodata profiles** (§2.3). `uint8`, `uint16`, `int16` and `float32`; `nodata` is a number or `null`; optional `mask` variable (§2.4). `int16` and `float32` are `none` only.
-- **Band objects** (§3.6). `bands` becomes a list of `{ name, common_name?, scale?, offset?, units? }` with a `band_names` string mirror; physical value is `stored * scale + offset`.
-- **Coverage and provenance** (§2.5, §3.8). Optional `coverage` variable and `provenance` object.
-- **Layout options and length hints** (§7, §3.7). `chunk_size` (256 or 512 recommended); `shard_time` and a multi-shard time grid; `shard_bytes`; `levels`.
-- **Volatility** (§5). Written for every store, `none` included, with a fixed divisor of 10000 for every dtype.
-- **Hosting** (§9). `404` for absent keys, no `Content-Encoding` on chunk and shard objects, `Timing-Allow-Origin` as a MAY, a missing shard object decodes as fill, upload order with the root `zarr.json` last.
-- **GDAL CRS** (§3.3). The data array carries `_CRS` for EPSG stores so GDAL assigns the CRS.
-- **Prior art** (§12). Corrected statements about Mapbox raster-array and zarr-layer; COG + TiTiler added.
-- **Unsharded is the writer default** (§7.1, §14). `encode()` writes one object per chunk unless sharding is asked for (`shard=True`, `--shard`, with `shard_time`); `--no-shard` remains accepted. `spec_version` stays `0.2.0`: both layouts were valid and readers handle both, so every store written with the sharded default is still valid and readable. Reason, from two measurements on the published 117-month Ucayali store (`docs/comparisons.md`, `docs/append.md`). First, a cold open spent 6.5 of 6.8 s on the nine shard-index reads: each is a 1,876-byte range read at the end of a shard of 83 to 174 MB, and a Cloudflare cache miss on it pulled the whole object from R2 (2 to 11 s; 0.36 s on a 41 MB shard). Second, an append to a sharded store rewrites the trailing shard (4389 MB against 686 MB unsharded over a 12-month cycle). Sharding had been chosen for object count (93 against about 5,900), which object storage does not charge for. Unsharded costs one object per cell, level and timestep, no index read, one chunk per CDN miss, and only new objects per append; sharded costs far fewer objects and one range read per timestep once the index is cached, with a miss proportional to the shard size.
-- **Delta references are the recorded map** (§4.2). A reference is valid when it names an anchor at distance `0 < d < anchor_interval`; the nearest-anchor schedule is the writer's default for new timesteps, not a validity rule, so an append can keep every published reference. `spec_version` stays `0.2.0`: every store written under the earlier rule (nearest anchor for `n_time`) is valid under this one, and readers already decoded through the recorded map.
-- **Appending** (§14). A store may grow at the end of its time axis.
-- **`pixels_per_tile` is no longer written** (§2.1, §3.4). Writers MUST NOT write `multiscales[0].datasets[].pixels_per_tile`; readers MUST ignore it if present; a validator accepts stores with or without it. Reason: CarbonPlan zarr-layer 0.10.0 reads the key as the marker of a global Web Mercator slippy-map pyramid, so a native-CRS store that carries it opens as a blank map; with the key removed from the root `zarr.json` the Ucayali store opens georegistered within 1 px (`docs/comparisons.md`). The cell size was already the chunk shape of the data arrays and the grid is in `chronozarr.levels`, so no information is lost. `spec_version` stays `0.2.0`: stores written earlier carry the key and remain valid, and for zarr-layer they need its `crs` and `bounds` constructor options or a root `zarr.json` rewritten without the key. An append (§14) leaves `multiscales` as it found it, key included.
-- **Unchanged.** Zarr v3 groups per level, `multiscales` in the ndpyramid form, `dimension_names` everywhere, consolidated metadata, native CRS, the index at the end of a sharded object, the anchor positions, the pyramid geometry. (The writer's layout default is the exception: the next entry.)
+Unsharded append MUST write only new timestep chunk objects and the mutable metadata/coordinates/optional metric. With sharding, only shards receiving new timesteps MAY be replaced: the previously partial trailing shard and any newly created time shards. Earlier completed shards MUST remain byte-identical. A replaced trailing shard MUST retain byte-identical encoded chunks and unchanged decoded values for all existing timesteps, although I does not promise identical offsets in a rewritten object.
 
-## 14. Appending
+Every existing unsharded data/mask/coverage chunk MUST remain byte-identical. All old band, x and y coordinate values and objects, level geometry, and M layout MUST remain unchanged. The existing prefix of the time coordinate MUST remain unchanged in value even though its single chunk is rewritten. No previously published data or validity meaning may change.
 
-A store MAY grow at the end of its time axis (`chronozarr append`). The new timesteps are strictly after the last one and have the store's grid, bands, dtype, CRS and nodata; a store with `mask` or `coverage` needs both planes for every new timestep, and a store without them cannot gain them.
+Objects that MAY change in place are root and descendant node metadata, each level's time-coordinate chunk, optional volatility, and previously partial trailing shards. All other existing chunk/shard objects MUST remain immutable. Hosts SHOULD give mutable objects short cache lifetimes. Append publication SHOULD upload new/replacement chunks and shards first, then time-coordinate chunks and optional volatility, then descendant metadata, and finally root metadata. Metadata-last ordering does not provide atomicity or automatic rollback; the working copy and validation are required.
 
-**What changes.**
+### 8.4 Reader snapshots and stale-index recovery
 
-- Every level's `data`, `mask` and `coverage` grow to the new `n_time`. `time` is rewritten as one chunk `c/0` of the new length.
-- The objects that gain data are written: for an unsharded store one chunk per new timestep, cell and level; for a sharded store the time shard that holds each new timestep, for every cell and level. A shard that already holds earlier timesteps is replaced by one holding the same chunks followed by the new ones and a new index. zarr-python 3.1 keeps the old chunks at their old offsets, so an index a reader cached earlier still points at the same bytes.
-- Root `zarr.json`: `chronozarr.times`, `temporal` (`anchor_indices`, and `delta_reference` gains the entries of the new non-anchor timesteps), `levels[].shape`, `shard_bytes` (the listed lengths of the shards written), and the consolidated metadata. Each array's `zarr.json` carries the new shape. `volatility` is updated: the new deltas join each cell's mean, so it equals the §5 definition over the recorded references up to float32 rounding.
-- A new timestep at level `k` is the block mean of the new timestep at level `k-1`, exactly as a fresh encode writes it. A new non-anchor timestep of a `star-delta` store references the nearest anchor that exists after the append, including anchors in the appended batch (§4.2); an anchor from an earlier append is read back from the store.
+A reader holding a previous root metadata snapshot MUST continue to interpret its listed timesteps with the previous shapes and compatible geometry. It MUST reload root metadata to discover new timesteps. Preservation of old bytes and values is required; preservation of offsets by a particular writer is not a universal guarantee.
 
-**What stays byte-identical.** Every chunk of an existing timestep, at every level; every time shard that receives no new timestep (all shards before the one holding the old last timestep, and that one too when the old axis ended exactly at its boundary); `band`, `x`, `y`; level and `multiscales` attributes; every existing `delta_reference` entry and anchor; and the `mask` and `coverage` planes of existing timesteps. Nothing a published chunk decodes to changes.
+For a mutable trailing shard, a reader MUST NOT blindly apply cached offsets from an old shard version to replacement bytes. A reader detecting a version/length mismatch, invalid index, failed index checksum or incompatible chunk read MUST discard the affected index, refresh metadata/length information and refetch the current index before retrying. Readers MUST keep array shapes consistent with their selected metadata snapshot; older listed timesteps remain readable from the updated shard's index. A stale listed length can put an end-index range at the wrong byte location. Reloading root/array metadata and obtaining the current object length are the recovery path. Once a subsequent shard begins, the previously completed shard MUST remain unchanged. Unsharded stores have no index-replacement hazard.
 
-**Choosing the layout.** A store meant for appends SHOULD be unsharded (§7.1), which is the writer default. An unsharded append writes only new chunk objects and the metadata: 55 MB per month in the Ucayali measurement (`docs/append.md`), nothing rewritten, no shard index for an open reader to hold stale, and the same chunk reads per timestep with no index read. A sharded append rewrites the shard that receives each new timestep, whole: with `shard_time` S the k-th append into a shard writes k chunks per cell, an average of `(S + 1) / 2`, measured as 4389 MB against 686 MB unsharded over a 12-month cycle at S = 12. A sharded store written with the whole-axis `shard_time` (`n_time` at creation) opens a second shard of the same length, which grows and is rewritten on every append until it is full. The price of unsharded is object count: the 117-month Ucayali store is about 5,900 objects against 93 sharded. Choose a finite `shard_time` (12 for monthly data) for an appendable store only when object count matters more than the rewrite cost, and the whole-axis `shard_time` for archives that are not appended to. `shard_time` MAY exceed `n_time` (§7.1), so the first batch of a sharded store can be a single timestep.
+## 9. Consumer contract
 
-**Publishing.** An append is not atomic and not reversible: write it to a working copy, run validation, then publish (`docs/hosting.md`). Objects change in place only in these classes, and a host SHOULD give them a short cache lifetime: the root and every other `zarr.json`; `time/c/0` of every level; `volatility/c/0/0`; and, for each cell, level and variable, the shard holding the last timestep (or, unsharded, nothing: new chunks are new keys). Every other chunk and shard object is immutable. Upload shards and chunks first, then `time/c/0` and `volatility`, then the `zarr.json` objects below the root, then the root `zarr.json` (§9).
+### 9.1 Profile and version rejection
 
-**Readers.** A reader holding the previous root `zarr.json` still decodes every timestep it lists, because their chunks, offsets and references are unchanged. It cannot see the new timesteps until it reloads the root. One hazard: the index of a shard is read with the shard length from `shard_bytes`. After an append the trailing shard is longer, so a reader that fetches such an index with the old length reads the wrong bytes and fails the index checksum; reloading the root `zarr.json` fixes it. Once the next shard has started, the earlier shard never changes again. An unsharded store has no shard index, so the hazard does not arise.
+A conforming reader MUST first GET `{store}/zarr.json` (or open the equivalent local root metadata) and check `attributes.chronozarr.spec_version`. It MUST accept exactly `"0.3.0"` and MUST reject any other or missing value before producing data. The error MUST name the unsupported/missing version and direct the user to `chronozarr convert`, for example: `Unsupported chronozarr spec_version 0.2.0; convert the store with chronozarr convert before opening it with a v0.3 reader.`
+
+v0.2 stores are converted, not read by v0.3 readers. There is no dual-version parser, automatic URL fallback, legacy band-string scale inference or legacy multiscales-list path. The conversion operation is outside the normal reader contract and this draft does not claim its implementation is already available.
+
+Readers MUST enforce the ordinary-value baseline and inherited Z extension rules before returning measurements. Mandatory-extension handling is inherited from Z, Extensions; this profile does not substitute an ignorable attribute flag for that mechanism.
+
+### 9.2 Metadata discovery and fallback
+
+Readers MUST take timestamps from `chronozarr.times`, band objects from `chronozarr.bands`, the variable name from `chronozarr.variable`, and validity inputs from `nodata`, `mask_variable` and `coverage_variable`. They MUST use band-name and level mirrors when present (§3.4), deriving missing `band_names` from the band objects.
+
+When `levels` is absent, readers MUST enumerate M's ordered `layout[].asset` groups and obtain canonical P/S geometry plus data shape/chunk/codec metadata at each level. Readers MUST use available consolidated metadata for those properties and MUST fall back to individual group/array node metadata when consolidation is absent. They MUST derive `cs` from inner chunks (§2.1), report any unsupported `data_type` or codec by name, and reject metadata contradictions rather than invent a geometry override. Mirrors avoid mandatory coordinate-array reads; validation MAY read their sources to test agreement.
+
+A generic client is not automatically a conforming chronozarr reader. Informative examples: `xarray.open_zarr(store, group="0")` opens a selected level with ordinary stored values; root `open_zarr` may be an empty dataset. GDAL subdataset enumeration is not proof that it attaches overview levels or applies a separate mask. These behaviors do not relax the contract for a chronozarr-aware consumer.
+
+### 9.3 Level, value and plane access
+
+Readers MUST select the largest level index `k` whose `resolution` does not exceed the requested output ground sample distance, or `k=0` if none qualifies. For a requested timestep and spatial cell they MUST read one ordinary data chunk using §§2 and 7, with the standard I decoding and Z bounds rules inherited in §0.2. They MUST NOT require another timestep's chunk to obtain that value.
+
+Readers MUST apply §4.1 validity in math, statistics and charts, and §4.4 scale/offset wherever physical values are shown or combined. They MUST read mask or coverage planes only when their corresponding declarations are present, and MUST NOT treat coverage as a validity substitute. Optional volatility MUST NOT be required for opening or reading data.
+
+Readers SHOULD cache decoded data chunks for the session and SHOULD prefetch ordinary frames to reduce interaction latency. They MUST retain the per-shard index cache and array-handle reuse rules in §7.2, while recovering correctly for mutable trailing shards (§8.4). Consolidated root discovery and mirrors preserve a single-root-request metadata path; the format does not promise a particular network latency or that every generic reader uses that path.
+
+## 10. Changes from 0.2
+
+This table is informative. It lists the removals and changes; retained chronozarr requirements are normative in §§1–9. v0.2 stores require explicit conversion and are not baseline v0.3 reader inputs.
+
+| v0.2 rule or surface | Removal / change in v0.3.0 | New section / authority |
+|---|---|---|
+| Version `0.2.x`, acceptance of `0.1.x` and `0.2.x` | Exact `0.3.0` draft version; every other or missing value rejected with `chronozarr convert` guidance. No automatic legacy fallback. | §§3.2, 9.1. |
+| Two temporal storage modes and required support for both | Removed; every array holds ordinary true values. No temporal mode declaration or mode-dependent dtype eligibility. | §§0.4, 1, 4.1. |
+| Star-delta anchors, anchor interval/indices, reference map and reference-distance rules | Removed entirely from baseline storage and reader requirements. | §§0.4, 1, 9.3. |
+| Modular residual representation, reconstruction, clamp/overflow policy and residual-specific nodata handling | Removed; only standard Zarr codec decoding remains. | §§1, 4.1, 9.3; Z/I. |
+| Residual-zero edge padding versus anchor fill | Removed; ordinary fill padding applies, with edge geometry/bounds inherited. | §2.1; Z, Chunk grids / shape. |
+| Temporal auto/none/star-delta writer selection, sample ratio/threshold and selection metadata | Removed; no temporal selection API or metadata is specified. | §§0.4, 3.2. |
+| Cross-shard temporal dependencies and two-data-chunk bound | Removed; one data chunk per timestep/cell after metadata/index discovery. | §§1, 7, 9.3. |
+| Anchor-multiple shard sizing and anchor-first prefetch/caches | Removed; sizing is based on host/append limits and caches/prefetch use ordinary chunks. | §§7.1–7.2, 9.3. |
+| Append additions to temporal maps, fixed references and reuse of earlier anchors | Removed; append extends ordinary values and preserves old chunks/values. | §8.3. |
+| Zarr hierarchy and leaf-node restatement | Replaced by upstream reference. | §0.2; Z, Hierarchy / Metadata. |
+| Edge chunk extent and array-bound trimming restatement | Replaced by upstream reference; fill-padding policy retained. | §§0.2, 2.1; Z, Chunk grids / shape. |
+| One-byte bytes-codec endian exception restatement | Replaced by upstream reference; numeric little-endian profile retained. | §§0.2, 7.3; B. |
+| Local consolidated-metadata recommendation | Replaced by M reference; nonconsolidated reader fallback retained. | §§0.2, 9.2; M, Consolidated Metadata. |
+| Local six-coefficient affine definition and corner formula | Replaced by S reference; north-up/factor-two/same-origin restrictions retained. | §§0.2, 2.3, 3.3; S. |
+| Shard index uint64 pairs, CRC layout, sentinel values, index-location/empty-shard semantics | Replaced by I reference; both-location support, end-location advice, cache and length hints retained. | §§0.2, 7.2; I. |
+| Node metadata naming versus v2 dotfiles | Replaced by Z reference. | §§0.2, 8.1; Z, Metadata. |
+| Standard shard decoding and array bounds in the reader algorithm | Replaced by I/Z reference; profile access/validity rules retained. | §§0.2, 9.3; I/Z. |
+| ndpyramid list, datasets, type and metadata.method/version/args fields | Replaced by M object layout, asset, derived_from, relative transforms and declared average resampling. | §3.3; M. |
+| `pixels_per_tile` emission/ignore/legacy acceptance rules | Removed; no legacy tile-size hint or parser. Cell size is derived from inner chunks. | §§2.1, 3.3, 9.1. |
+| Implicit convention composition | Explicit root chronozarr/M and spatial-array P/S registrations with literal v0.1 URLs. Snapshots recorded only as informative references. | §§0.3, 3.1. |
+| Optional proj/spatial aliases and nonrequirement | Canonical array P/S metadata and registrations required; EPSG `proj:code`, affine geometry and explicit pixel registration required. | §§2.3, 3.3. |
+| EPSG/native CRS mirrors interpreted as authorities | EPSG north-up scope fixed; P/S authoritative, mirrors validated against them; rotated/non-EPSG grids excluded. | §§2.3, 3.3–3.4. |
+| `_CRS` compatibility alias | Writers SHOULD emit it for GDAL below 3.13; not a v0.3 reader requirement. Reader observations distinguish CRS assignment from overview attachment. | §§0.3, 3.3. |
+| Levels mirrors tied to legacy datasets paths | Paths now match M layout assets; geometry equality uses canonical S and Z shape. | §3.4. |
+| String-only bands and implicit source-specific physical scaling | Removed; object-only bands, explicit scale/offset advice and consumer physical-value rules retained. | §§4.4, 9.1. |
+| Mandatory volatility, and its dependence on temporal encoding | Volatility MAY be absent; when present the existing exact-difference/normalization metric uses a nominal comparison policy independent of storage. | §6. |
+| Overview reduction followed by temporal encoding | Removed encoding stage; true-value block means, validity, edge replication and rounding retained. | §5. |
+| Claims that all shard lengths are immutable | Lengths describe a snapshot and MUST change with rewritten append objects; HEAD/recovery retained. | §§7.2, 8.4. |
+| Assumption that a writer keeps old shard chunk offsets | No universal offset guarantee; old encoded chunk bytes/decoded values preserved, cached index must be refreshed for changed shards. | §§8.3–8.4. |
+| Metadata-last publication described as sufficient to prevent missing-data views | Publication order retained with explicit non-atomicity and working-copy validation. | §§8.2–8.4. |
+| Append always updates volatility | Update only when volatility exists; absence remains conforming. | §§6, 8.3. |
+| Sections 0–14 and “Changes from 0.1” history | Reorganized as sections 0–9 plus this table; old change file is a pointer to this section. Historical implementation/prior-art prose is not a baseline conformance rule. | §10. |
+| Reference implementations described as current spec implementations | This is a draft; observed generic-reader capabilities are informative, not a claim that existing chronozarr code implements v0.3.0. | §§0, 0.3, 9.2. |

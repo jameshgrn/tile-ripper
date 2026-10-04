@@ -59,7 +59,7 @@ for (const [width, height] of [[360, 740], [803, 600]]) {
     test.use({ viewport: { width, height } });
 
     test('the product control and the timeline are visible and not clipped', async ({ page, servers, storeUrl }) => {
-      await openViewer(page, servers, await storeUrl('u16_stardelta'));
+      await openViewer(page, servers, await storeUrl('u16_sharded'));
       expect(await page.evaluate(findLayoutProblems), `layout problems at ${width} x ${height}`).toEqual([]);
     });
   });

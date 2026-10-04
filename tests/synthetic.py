@@ -50,21 +50,18 @@ def build_store(
     truth: np.ndarray,
     *,
     shard: bool,
-    anchor_interval: int = 2,
     chunk_size: int = 512,
     n_lods: int | None = None,
-    encoding: str = "star-delta",
     **kwargs,
 ) -> EncodeReport:
-    """Encode `truth` with star-delta by default (most tests are about its mechanics)."""
+    """Encode an ordinary-value v0.3 store."""
+    kwargs.setdefault("volatility", True)
     return chronozarr.encode(
         make_da(truth, BANDS[: truth.shape[1]] if truth.shape[1] <= len(BANDS) else None),
         path,
-        anchor_interval=anchor_interval,
         chunk_size=chunk_size,
         n_lods=n_lods,
         shard=shard,
-        encoding=encoding,
         **kwargs,
     )
 
@@ -100,7 +97,7 @@ def reference_anchor_schedule(n_time: int, interval: int) -> dict[int, int]:
 def make_correlated(
     n_time: int, n_band: int, height: int, width: int, seed: int = 11
 ) -> np.ndarray:
-    """A smooth scene that barely changes between timesteps: star-delta compresses it well."""
+    """A smooth scene that barely changes between timesteps."""
     rng = np.random.default_rng(seed)
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
     base = 3000 + 1200 * np.sin(yy / 40) * np.cos(xx / 30) + rng.normal(0, 150, (height, width))

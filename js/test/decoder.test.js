@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { openStore, applyDelta, chunkKey, defaultTotalBytes, samplePixelFrom, scrubCost, windowOrder } from '../chronozarr/decoder.js';
+import { openStore, chunkKey, defaultTotalBytes, samplePixelFrom, scrubCost, windowOrder } from '../chronozarr/decoder.js';
 import { buildSyntheticStore, sourceValue } from '../support/synthetic-store.js';
 import { startStaticServer } from '../support/static-server.js';
 
@@ -28,13 +28,8 @@ async function bandSums(store, lod, t) {
   return sums;
 }
 
-test('chunkKey and applyDelta', () => {
+test('chunkKey identifies one true-value chunk', () => {
   assert.equal(chunkKey(1, 2, 3, 4), '1/2/3/4');
-  const anchor = Uint16Array.of(100, 100, 65535, 0);
-  const residual = Int16Array.of(-150, 25, 10, -1);
-  const out = applyDelta(anchor, new Uint16Array(residual.buffer));
-  assert.deepEqual([...out], [65486, 125, 9, 65535], 'modulo 2^16: wraps, never clamps');
-  assert.deepEqual([...applyDelta(Uint8Array.of(250, 3), Uint8Array.of(10, 253))], [4, 0], 'modulo 2^8 for uint8');
 });
 
 for (const name of FIXTURES) {
@@ -116,10 +111,9 @@ test('fixture unsharded: one plain GET per chunk, no HEAD, no range', { skip: sk
 });
 
 for (const indexLocation of ['end', 'start']) {
-  test(`synthetic sharded store (index at ${indexLocation}): lossless star-delta roundtrip`, async () => {
-    const spec = { nTime: 7, nBand: 3, height: 70, width: 45, chunk: 32, anchorInterval: 3, sharded: true, indexLocation };
+  test(`synthetic sharded store (index at ${indexLocation}): lossless true-value roundtrip`, async () => {
+    const spec = { nTime: 7, nBand: 3, height: 70, width: 45, chunk: 32,  sharded: true, indexLocation };
     const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec) });
-    assert.deepEqual(store.anchorIndices, [0, 3, 6]);
     const level = store.levels[0];
     assert.equal(level.gridRows, 3);
     assert.equal(level.gridCols, 2);
@@ -146,7 +140,7 @@ for (const indexLocation of ['end', 'start']) {
 }
 
 test('start-indexed shard: index read is a prefix range, not a suffix range', async () => {
-  const readable = buildSyntheticStore({ nTime: 4, nBand: 1, height: 20, width: 20, chunk: 32, anchorInterval: 2, sharded: true, indexLocation: 'start' });
+  const readable = buildSyntheticStore({ nTime: 4, nBand: 1, height: 20, width: 20, chunk: 32,  sharded: true, indexLocation: 'start' });
   const store = await openStore('memory://synthetic', { store: readable });
   await store.getRaw(0, 0, 0, 1);
   const shardCalls = readable.log.filter((c) => c.key === '/0/data/c/0/0/0/0');
@@ -155,33 +149,33 @@ test('start-indexed shard: index read is a prefix range, not a suffix range', as
 });
 
 test('unsharded synthetic store decodes', async () => {
-  const spec = { nTime: 4, nBand: 2, height: 40, width: 33, chunk: 32, anchorInterval: 2, sharded: false };
+  const spec = { nTime: 4, nBand: 2, height: 40, width: 33, chunk: 32,  sharded: false };
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec) });
   const cell = await store.getCell(0, 1, 1, 3);
   assert.equal(cell.data[(1 * 32 + 2) * 32 + 0], sourceValue(3, 1, 34, 32));
 });
 
-test('getCell returns the anchor array itself for anchors and a new array for deltas', async () => {
-  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: true };
+test('getCell returns the cached true-value array at every timestep', async () => {
+  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec) });
-  const anchorCell = await store.getCell(0, 0, 0, 2);
-  assert.equal(anchorCell.data, store.peekRaw(0, 0, 0, 2));
-  const deltaCell = await store.getCell(0, 0, 0, 3);
-  assert.notEqual(deltaCell.data, store.peekRaw(0, 0, 0, 3));
+  const firstCell = await store.getCell(0, 0, 0, 2);
+  assert.equal(firstCell.data, store.peekRaw(0, 0, 0, 2));
+  const nextCell = await store.getCell(0, 0, 0, 3);
+  assert.equal(nextCell.data, store.peekRaw(0, 0, 0, 3));
 });
 
-test('samplePixel returns null until both anchor and delta are cached', async () => {
-  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: true };
+test('samplePixel returns null until the requested data chunk is cached', async () => {
+  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec) });
   assert.equal(store.samplePixel(0, 0, 0, 3, 1, 1), null);
   await store.getRaw(0, 0, 0, 2);
-  assert.equal(store.samplePixel(0, 0, 0, 3, 1, 1), null, 'anchor alone is not enough for a delta timestep');
+  assert.equal(store.samplePixel(0, 0, 0, 3, 1, 1), null, 'another timestep does not satisfy the requested chunk');
   await store.getRaw(0, 0, 0, 3);
   assert.equal(store.samplePixel(0, 0, 0, 3, 1, 1)[0], sourceValue(3, 0, 1, 1));
 });
 
 test('concurrent requests for one chunk share one fetch', async () => {
-  const readable = buildSyntheticStore({ nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: false });
+  const readable = buildSyntheticStore({ nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: false });
   const store = await openStore('memory://synthetic', { store: readable });
   const before = readable.log.length;
   const [a, b] = await Promise.all([store.getRaw(0, 0, 0, 1), store.getRaw(0, 0, 0, 1)]);
@@ -189,8 +183,8 @@ test('concurrent requests for one chunk share one fetch', async () => {
   assert.equal(readable.log.length - before, 1);
 });
 
-test('prefetch: nearest timesteps first, scrub direction reaches further, anchors pulled in with their deltas', async () => {
-  const spec = { nTime: 12, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 4, sharded: true };
+test('prefetch: nearest timesteps first, scrub direction reaches further, each timestep fetched once', async () => {
+  const spec = { nTime: 12, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const run = async (direction) => {
     const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec) });
     const order = [];
@@ -199,8 +193,8 @@ test('prefetch: nearest timesteps first, scrub direction reaches further, anchor
     assert.equal(result.planned, 12);
     return order;
   };
-  assert.deepEqual(await run(1), [4, 5, 6, 7, 8, 0, 3, 9, 10, 2, 11, 1], 'anchor 4 first, then 6, 7 ahead of 4-behind 3');
-  assert.deepEqual(await run(-1), [4, 5, 6, 0, 3, 2, 7, 1, 8, 9, 10, 11], 'backward neighbours come first when scrubbing backward');
+  assert.deepEqual(await run(1), [5, 6, 4, 7, 8, 3, 9, 10, 2, 11, 1, 0], 't=5 first, then the nearest neighbours in scrub-cost order');
+  assert.deepEqual(await run(-1), [5, 4, 6, 3, 2, 7, 1, 0, 8, 9, 10, 11], 'backward neighbours come first when scrubbing backward');
 });
 
 test('scrubCost: behind costs more, and with circular time the first timesteps are just ahead of the last', () => {
@@ -220,29 +214,29 @@ test('windowOrder with loop puts the start of the movie right after its end', ()
 });
 
 test('the prefetch window plan covers the wrap: from the last timestep it fetches t=0, 1, 2 before anything behind', async () => {
-  const spec = { nTime: 12, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 4, sharded: true };
+  const spec = { nTime: 12, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const chunkBytes = 32 * 32 * 2;
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec), maxCacheBytes: chunkBytes * 8, compressedBytes: 0 });
   const order = [];
   const result = await store.prefetch({ lod: 0, cells: [[0, 0]], t: 11, direction: 1, behindFactor: 8, loop: true, concurrency: 1, onChunk: (l, r, c, t) => order.push(t) });
   assert.equal(result.planned, 7, 'floor(0.9 x 8 chunks)');
-  assert.deepEqual(order, [8, 11, 0, 1, 2, 3, 4], "t=11's anchor 8, t=11, then the start of the movie in order");
+  assert.deepEqual(order, [11, 0, 1, 2, 3, 4, 5], "t=11, then the start of the movie in order");
   assert.equal(store.peekRaw(0, 0, 0, 10), undefined, 'the step just behind is not worth keeping');
 });
 
 test('a large behindFactor makes the prefetch window run almost entirely ahead (movie playback)', async () => {
-  const spec = { nTime: 40, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 8, sharded: true };
+  const spec = { nTime: 40, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const chunkBytes = 32 * 32 * 2;
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec), maxCacheBytes: chunkBytes * 14, compressedBytes: 0 });
   const result = await store.prefetch({ lod: 0, cells: [[0, 0]], t: 20, direction: 1, behindFactor: 50, concurrency: 1 });
   assert.equal(result.planned, 12, 'floor(0.9 x 14 chunks)');
   const cached = [];
   for (let t = 0; t < 40; t++) if (store.peekRaw(0, 0, 0, t)) cached.push(t);
-  assert.deepEqual(cached, [16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30], 'the anchor behind t, then everything ahead');
+  assert.deepEqual(cached, [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], 'the target timestep, then everything ahead');
 });
 
-test('prefetch window is sized by the cache budget, never anchors everywhere', async () => {
-  const spec = { nTime: 40, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 8, sharded: true };
+test('prefetch window is sized by the cache budget, bounded to nearby timesteps', async () => {
+  const spec = { nTime: 40, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const chunkBytes = 32 * 32 * 2;
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec), maxCacheBytes: chunkBytes * 10, compressedBytes: 0 });
   const result = await store.prefetch({ lod: 0, cells: [[0, 0]], t: 20, concurrency: 1 });
@@ -251,7 +245,7 @@ test('prefetch window is sized by the cache budget, never anchors everywhere', a
   assert.equal(store.stats.cache.evictions, 0);
   const cached = [];
   for (let t = 0; t < 40; t++) if (store.peekRaw(0, 0, 0, t)) cached.push(t);
-  assert.deepEqual(cached, [16, 18, 19, 20, 21, 22, 23, 24, 25], 'a window around t=20, reaching further ahead (25) than behind (18), with its anchors 16 and 24');
+  assert.deepEqual(cached, [17, 18, 19, 20, 21, 22, 23, 24, 25], 'a window around t=20, reaching further ahead (25) than behind (18)');
 
   const everything = await openStore('memory://synthetic', { store: buildSyntheticStore(spec), maxCacheBytes: chunkBytes * 100, compressedBytes: 0 });
   const full = await everything.prefetch({ lod: 0, cells: [[0, 0]], t: 20, playing: true, concurrency: 1 });
@@ -259,11 +253,11 @@ test('prefetch window is sized by the cache budget, never anchors everywhere', a
 });
 
 test('prefetch skips cached chunks and honours abort', async () => {
-  const spec = { nTime: 10, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 3, sharded: true };
+  const spec = { nTime: 10, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec) });
   await store.getRaw(0, 0, 0, 0);
   const result = await store.prefetch({ lod: 0, cells: [[0, 0]], t: 0, concurrency: 1 });
-  assert.equal(result.skipped, 1, 'the cached anchor 0 is skipped');
+  assert.equal(result.skipped, 1, 'the cached timestep 0 is skipped');
   assert.equal(result.fetched, 9);
 
   const aborted = new AbortController();
@@ -274,7 +268,7 @@ test('prefetch skips cached chunks and honours abort', async () => {
 });
 
 test('prefetch waits for demand fetches and demand is never queued behind it', async () => {
-  const spec = { nTime: 6, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 3, sharded: true, delayMs: 15 };
+  const spec = { nTime: 6, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true, delayMs: 15 };
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec) });
   const chunks = [];
   store.probe = (event) => chunks.push(event);
@@ -288,7 +282,7 @@ test('prefetch waits for demand fetches and demand is never queued behind it', a
 });
 
 test('eviction is least recently used by default and follows evictionScore when set', async () => {
-  const spec = { nTime: 10, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 3, sharded: true };
+  const spec = { nTime: 10, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const chunkBytes = 32 * 32 * 2;
   const lru = await openStore('memory://synthetic', { store: buildSyntheticStore(spec), maxCacheBytes: chunkBytes * 3 });
   for (const t of [0, 1, 2]) await lru.getRaw(0, 0, 0, t);
@@ -307,7 +301,7 @@ test('eviction is least recently used by default and follows evictionScore when 
 });
 
 test('a background chunk never displaces a better one', async () => {
-  const spec = { nTime: 10, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 3, sharded: true };
+  const spec = { nTime: 10, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const chunkBytes = 32 * 32 * 2;
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec), maxCacheBytes: chunkBytes * 2, compressedBytes: 0 });
   store.evictionScore = (entry) => Math.abs(entry.t - 5);
@@ -320,7 +314,7 @@ test('a background chunk never displaces a better one', async () => {
 });
 
 test('a caller that aborts is released; the fetch is cancelled when nobody is left', async () => {
-  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: false, delayMs: 30 };
+  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: false, delayMs: 30 };
   const readable = buildSyntheticStore(spec);
   const store = await openStore('memory://synthetic', { store: readable });
   const chunkSignals = () => readable.log.filter((c) => c.key.includes('/c/1/')).map((c) => c.signal);
@@ -346,7 +340,7 @@ test('a caller that aborts is released; the fetch is cancelled when nobody is le
 });
 
 test('a caller without a signal keeps a fetch alive when other callers abort', async () => {
-  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: false, delayMs: 20 };
+  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: false, delayMs: 20 };
   const readable = buildSyntheticStore(spec);
   const store = await openStore('memory://synthetic', { store: readable });
   const abort = new AbortController();
@@ -358,7 +352,7 @@ test('a caller without a signal keeps a fetch alive when other callers abort', a
 });
 
 test('close() aborts in-flight requests', async () => {
-  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: false, delayMs: 50 };
+  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: false, delayMs: 50 };
   const readable = buildSyntheticStore(spec);
   const store = await openStore('memory://synthetic', { store: readable });
   const pending = store.getRaw(0, 0, 0, 1);
@@ -367,7 +361,7 @@ test('close() aborts in-flight requests', async () => {
 });
 
 test('chunk probe events carry fetch and decode timestamps', async () => {
-  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: true };
+  const spec = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec) });
   const events = [];
   store.probe = (event) => events.push(event);
@@ -381,7 +375,7 @@ test('chunk probe events carry fetch and decode timestamps', async () => {
 });
 
 test('a corrupt shard index fails with an actionable message', async () => {
-  const readable = buildSyntheticStore({ nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: true });
+  const readable = buildSyntheticStore({ nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true });
   const shard = readable.files.get('/0/data/c/0/0/0/0');
   shard[shard.length - 10] ^= 0xff;
   const store = await openStore('memory://synthetic', { store: readable });
@@ -390,7 +384,7 @@ test('a corrupt shard index fails with an actionable message', async () => {
 });
 
 test('missing chunks and empty shard entries decode as the fill value', async () => {
-  const readable = buildSyntheticStore({ nTime: 2, nBand: 1, height: 40, width: 40, chunk: 32, anchorInterval: 2, sharded: false });
+  const readable = buildSyntheticStore({ nTime: 2, nBand: 1, height: 40, width: 40, chunk: 32,  sharded: false });
   readable.files.delete('/0/data/c/0/0/1/1');
   const store = await openStore('memory://synthetic', { store: readable });
   const data = await store.getRaw(0, 1, 1, 0);
@@ -400,7 +394,7 @@ test('missing chunks and empty shard entries decode as the fill value', async ()
 
 test('errors carry the store URL and the reason', async () => {
   await assert.rejects(openStore('memory://empty', { store: { get: async () => undefined, getRange: async () => undefined } }), /memory:\/\/empty.*root zarr\.json not found/);
-  const readable = buildSyntheticStore({ nTime: 2, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: true });
+  const readable = buildSyntheticStore({ nTime: 2, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true });
   const store = await openStore('memory://synthetic', { store: readable });
   await assert.rejects(store.getRaw(0, 5, 0, 0), /cell \(5, 0\) outside 1x1 grid at lod 0/);
   await assert.rejects(store.getRaw(0, 0, 0, 9), /timestep 9 out of range 0\.\.1/);
@@ -417,7 +411,7 @@ test('joint cache budget: 1.5 GiB from 8 GB of device memory, else 768 MiB', () 
 });
 
 test('loopFits: whether the whole time axis of some cells fits 90% of the cache budget', async () => {
-  const spec = { nTime: 20, nBand: 2, height: 16, width: 16, chunk: 32, anchorInterval: 4, sharded: true };
+  const spec = { nTime: 20, nBand: 2, height: 16, width: 16, chunk: 32,  sharded: true };
   const chunkBytes = 2 * 32 * 32 * 2;
   const store = await openStore('memory://synthetic', { store: buildSyntheticStore(spec), maxCacheBytes: chunkBytes * 100 });
   assert.equal(store.loopFits(0, 4), true, '4 cells x 20 timesteps = 80 chunks <= 90');
@@ -425,16 +419,12 @@ test('loopFits: whether the whole time axis of some cells fits 90% of the cache 
   assert.equal(store.loopFits(0, 0), true);
 });
 
-test('samplePixelFrom decodes an anchor and a delta modulo 2^bits', () => {
+test('samplePixelFrom samples true values in every supported dtype', () => {
   const geometry = { nBand: 2, chunkWidth: 2, chunkHeight: 1 };
-  const anchor = Uint16Array.of(100, 65000, 7, 9);
-  const delta = new Uint16Array(Int16Array.of(-150, 2000, 3, -10).buffer);
-  assert.deepEqual([...samplePixelFrom(anchor, null, geometry, 1, 0)], [65000, 9]);
-  const wrapped = samplePixelFrom(anchor, delta, geometry, 0, 0);
-  assert.ok(wrapped instanceof Uint16Array);
-  assert.deepEqual([...wrapped], [65486, 10], '100 - 150 wraps to 65486');
-  assert.deepEqual([...samplePixelFrom(anchor, delta, geometry, 1, 0)], [1464, 65535], '65000 + 2000 wraps to 1464; 9 - 10 wraps to 65535');
-  const bytes = samplePixelFrom(Uint8Array.of(250, 1), Uint8Array.of(10, 255), { nBand: 1, chunkWidth: 2, chunkHeight: 1 }, 0, 0);
-  assert.ok(bytes instanceof Uint8Array);
-  assert.deepEqual([...bytes], [4], 'uint8 wraps at 256');
+  for (const Typed of [Uint8Array, Uint16Array, Int16Array, Float32Array]) {
+    const data = Typed.of(100, 200, 7, 9);
+    const pixel = samplePixelFrom(data, geometry, 1, 0);
+    assert.ok(pixel instanceof Typed);
+    assert.deepEqual([...pixel], [200, 9]);
+  }
 });

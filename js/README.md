@@ -1,10 +1,14 @@
 # chronozarr
 
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
+
 Browser and Node reader for [chronozarr](https://github.com/chronozarr/chronozarr) stores, plus a MapLibre GL JS custom layer that draws one.
 
-A chronozarr store is a Zarr v3 time series of rasters with a multiscale pyramid, written one object per chunk by default and optionally sharded, laid out so a client reads one timestep of one map cell with one HTTP request (a plain `GET` of one chunk; for a sharded store one range read of a shard once its index is cached). The reader turns `(lod, row, col, t)` into a typed array: it caches shard indexes (sharded stores), decodes in a worker pool, reconstructs star-delta timesteps, and prefetches a window of the time axis around the current timestep. It reads spec 0.1 and 0.2 stores ([spec](https://github.com/chronozarr/chronozarr/blob/main/spec/CHRONOZARR.md)). The Python package `chronozarr` writes them.
+A chronozarr store is a Zarr v3 time series of rasters with a multiscale pyramid, written one object per chunk by default and optionally sharded, laid out so a client reads one timestep of one map cell with one HTTP request (a plain `GET` of one chunk; for a sharded store one range read of a shard once its index is cached). The reader turns `(lod, row, col, t)` into a typed array: it caches shard indexes (sharded stores), decodes in a worker pool, prefetches a window of the time axis around the current timestep. It reads spec 0.3 stores ([spec](https://github.com/chronozarr/chronozarr/blob/main/spec/CHRONOZARR.md)). The Python package `chronozarr` writes them.
 
 The package is plain ES modules. There is no build step and no runtime dependency: zarrita and numcodecs are vendored (see [Licenses](#licenses)).
+
+The v0.3 CDN URLs below become available after npm publication.
 
 ## Install
 
@@ -33,8 +37,8 @@ or at a CDN:
 ```html
 <script type="importmap">
 { "imports": {
-  "chronozarr": "https://cdn.jsdelivr.net/npm/chronozarr@0.2.0/chronozarr/decoder.js",
-  "chronozarr/maplibre": "https://cdn.jsdelivr.net/npm/chronozarr@0.2.0/maplibre/layer.js"
+  "chronozarr": "https://cdn.jsdelivr.net/npm/chronozarr@0.3.0/chronozarr/decoder.js",
+  "chronozarr/maplibre": "https://cdn.jsdelivr.net/npm/chronozarr@0.3.0/maplibre/layer.js"
 } }
 </script>
 ```
@@ -52,7 +56,7 @@ The decode worker is found relative to `decoder.js` (`new URL('./decode-worker.j
 ```js
 import { openStore } from 'chronozarr';
 
-const store = await openStore('https://data.tileripper.com/ucayali_santa_maria/chronozarr-4');
+const store = await openStore('https://your-host/v03-store');
 console.log(store.times.length, store.bands, store.dtype, store.crs);
 // 117 [ 'B02', 'B03', 'B04', 'B08' ] 'uint16' 'EPSG:32718'
 
@@ -66,7 +70,7 @@ console.log(stored(2, 100, 100) * scale + offset); // reflectance
 store.close(); // aborts in-flight requests and releases the decode workers
 ```
 
-`getCell` returns exact stored values (anchors are true values; residuals of star-delta stores are added back). `store.levels[lod]` describes each pyramid level (`gridRows`, `gridCols`, `width`, `height`, `resolution`, `transform`), `store.prefetch({ lod, cells, t })` fills the caches around a timestep, and `store.stats()` reports requests, bytes and cache hits. `openStore` options include `fetch`, `workers`, `totalBytes` (the joint cap for the decoded and compressed tiers, 1.5 GiB on machines reporting 8 GB or more, else 768 MiB), `horizonSteps`, `idleBytes` and `idleMs` (how far and how much idle prefetch reaches: 12 timesteps either side and 64 MiB per view by default), `maxRequests` and `retryDelaysMs`; they are documented in `chronozarr/decoder.js`. `prefetch` takes `playing: true` to extend to the whole loop and `masks: true` to fetch masks alongside chunks. The host must serve the store with byte ranges and CORS; `chronozarr doctor <url>` from the Python package checks that.
+`getCell` returns exact stored values at every timestep. `store.levels[lod]` describes each pyramid level (`gridRows`, `gridCols`, `width`, `height`, `resolution`, `transform`), `store.prefetch({ lod, cells, t })` fills the caches around a timestep, and `store.stats()` reports requests, bytes and cache hits. `openStore` options include `fetch`, `workers`, `totalBytes` (the joint cap for the decoded and compressed tiers, 1.5 GiB on machines reporting 8 GB or more, else 768 MiB), `horizonSteps`, `idleBytes` and `idleMs` (how far and how much idle prefetch reaches: 12 timesteps either side and 64 MiB per view by default), `maxRequests` and `retryDelaysMs`; they are documented in `chronozarr/decoder.js`. `prefetch` takes `playing: true` to extend to the whole loop and `masks: true` to fetch masks alongside chunks. The host must serve the store with byte ranges and CORS; `chronozarr doctor <url>` from the Python package checks that.
 
 ## Draw a store on a MapLibre map
 
@@ -76,7 +80,7 @@ import { ChronozarrLayer } from 'chronozarr/maplibre';
 
 const map = new maplibregl.Map({ container: 'map', style: 'https://demotiles.maplibre.org/style.json' });
 const layer = new ChronozarrLayer({
-  url: 'https://data.tileripper.com/ucayali_santa_maria/chronozarr-4', // store root (holds zarr.json)
+  url: 'https://your-host/v03-store', // store root (holds zarr.json)
   product: 'true_color', // layer.products lists what the store's bands support
   t: 0, // timestep index
   prefetch: true, // fill the reader's caches around t in the background

@@ -4,7 +4,7 @@ import { resolveObjectURL } from 'node:buffer';
 import { openStore } from '../chronozarr/decoder.js';
 import { buildSyntheticStore, defaultValues } from '../support/synthetic-store.js';
 
-const SPEC = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 2, sharded: true };
+const SPEC = { nTime: 4, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: true };
 
 /**
  * Install a stand-in for the Worker constructor for the duration of `body`. `onConstruct(call)` may throw; the

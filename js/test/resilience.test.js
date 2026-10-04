@@ -5,7 +5,7 @@ import { RequestLimiter } from '../chronozarr/limiter.js';
 import { buildSyntheticStore } from '../support/synthetic-store.js';
 import { filesFetch } from '../support/files-fetch.js';
 
-const SPEC = { nTime: 4, nBand: 1, height: 40, width: 40, chunk: 32, anchorInterval: 2, sharded: false };
+const SPEC = { nTime: 4, nBand: 1, height: 40, width: 40, chunk: 32,  sharded: false };
 const URL_BASE = 'https://example.test/store';
 const isChunk = (key, t) => key.includes(`/c/${t}/0/0/0`);
 
@@ -25,7 +25,7 @@ test('network errors, 5xx and 429 are retried and the chunk then loads', async (
   assert.ok((await store.getRaw(0, 0, 0, 3)) instanceof Uint16Array);
   assert.equal(log.filter((c) => isChunk(c.key, 1)).length, 2);
   assert.equal(log.filter((c) => isChunk(c.key, 3)).length, 3);
-  assert.equal(store.stats.network.requests, 1 + 1 + 1 + 2 + 3, 'root + array metadata + level group + every attempt of both chunks');
+  assert.equal(store.stats.network.requests, 1 + 1 + 2 + 3, 'root + array metadata + every attempt of both chunks');
   assert.equal(warn.mock.callCount(), 3);
   const [message, details] = warn.mock.calls[0].arguments;
   assert.match(message, /retrying/);
@@ -108,11 +108,11 @@ test('wire bytes come from Content-Length of GET/range responses, not HEAD', asy
 });
 
 test('at most maxRequests fetches are in flight', async () => {
-  const spec = { nTime: 30, nBand: 1, height: 16, width: 16, chunk: 32, anchorInterval: 3, sharded: false };
+  const spec = { nTime: 30, nBand: 1, height: 16, width: 16, chunk: 32,  sharded: false };
   const { store, fetchImpl, log } = await open({ maxRequests: 3 }, spec, { delayMs: 5 });
   await Promise.all(Array.from({ length: 30 }, (_, t) => store.getRaw(0, 0, 0, t)));
   assert.equal(fetchImpl.stats.peak, 3);
-  assert.equal(log.length, 33, 'root, array metadata, level group and 30 chunks');
+  assert.equal(log.length, 32, 'root, array metadata and 30 chunks');
 });
 
 test('limiter: priority order, abort before start, failures free the slot', async () => {
@@ -141,7 +141,7 @@ test('limiter: priority order, abort before start, failures free the slot', asyn
 test('prefetch leaves a cell alone after one of its chunks failed', async (t) => {
   t.mock.method(console, 'warn', () => {});
   t.mock.method(console, 'error', () => {});
-  const spec = { nTime: 6, nBand: 1, height: 40, width: 40, chunk: 32, anchorInterval: 3, sharded: false };
+  const spec = { nTime: 6, nBand: 1, height: 40, width: 40, chunk: 32,  sharded: false };
   const { store, log } = await open({}, spec, { fail: ({ key }) => (key.endsWith('/0/1') ? 503 : null) });
   const first = await store.prefetch({ lod: 0, cells: [[0, 0], [0, 1]], t: 0, concurrency: 1 });
   assert.equal(first.errors.length, 1, 'one failure is reported, not one per chunk');

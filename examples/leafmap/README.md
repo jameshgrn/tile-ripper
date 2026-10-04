@@ -1,5 +1,7 @@
 # chronozarr in leafmap
 
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
+
 Install `chronozarr[leafmap]` and open `demo.ipynb` in a local notebook. The helper uses
 `leafmap.maplibregl.Map`, not leafmap's default ipyleaflet backend:
 

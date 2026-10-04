@@ -95,7 +95,7 @@ def test_file_stem_keeps_the_clock_only_when_needed():
 def store_and_truth(tmp_path_factory):
     truth = make_truth(5, 2, 40, 50)
     path = tmp_path_factory.mktemp("export") / "store"
-    build_store(path, truth, shard=True, chunk_size=16, anchor_interval=2)
+    build_store(path, truth, shard=True, chunk_size=16)
     return path, truth
 
 
@@ -113,7 +113,7 @@ def test_every_timestep_roundtrips_through_rasterio(store_and_truth, tmp_path):
     store = chronozarr.open_store(path)
     for t, tif in enumerate(paths):
         with rasterio.open(tif) as src:
-            assert np.array_equal(src.read(), truth[t])  # includes non-anchor timesteps
+            assert np.array_equal(src.read(), truth[t])
             assert src.crs.to_string() == store.attrs.crs
             assert tuple(src.transform)[:6] == store.levels[0].transform
             assert src.descriptions == tuple(BANDS)
@@ -192,9 +192,7 @@ def test_convert_then_export_cog_preserves_validity_scale_offset_units_and_value
     build, shared, nodata, has_mask = ROUND_TRIPS[name]
     cogs = build(tmp_path)
     store_path = tmp_path / "store"
-    convert(
-        fx.write_manifest(tmp_path / "m.csv", cogs), store_path, chunk_size=16, anchor_interval=2
-    )
+    convert(fx.write_manifest(tmp_path / "m.csv", cogs), store_path, chunk_size=16)
     tifs = export_cog(store_path, tmp_path / "out")
     assert len(tifs) == fx.N_TIME
     n_band = cogs.data.shape[1]
@@ -230,7 +228,7 @@ def test_zarr_with_cf_attributes_roundtrips_to_cogs(tmp_path, flags):
     zarr_set = fx.cf_zarr(tmp_path / "in.zarr", **flags)
     store_path = tmp_path / "store"
     kwargs = {"variable": "v", "mask_var": "ok"} if flags else {}
-    convert(zarr_set.path, store_path, chunk_size=16, anchor_interval=2, **kwargs)
+    convert(zarr_set.path, store_path, chunk_size=16, **kwargs)
     shared = bool(flags)
     for t, tif in enumerate(export_cog(store_path, tmp_path / "out")):
         expected = (
@@ -251,9 +249,7 @@ def test_zarr_with_cf_attributes_roundtrips_to_cogs(tmp_path, flags):
 def masked_store(tmp_path, truth, mask, **encode_kwargs):
     # A mask store has no nodata by default; tests about the nodata tag next to a mask ask for 0.
     path = tmp_path / "store"
-    chronozarr.encode(
-        make_da(truth, BANDS), path, mask=mask, chunk_size=16, anchor_interval=2, **encode_kwargs
-    )
+    chronozarr.encode(make_da(truth, BANDS), path, mask=mask, chunk_size=16, **encode_kwargs)
     return path
 
 
@@ -320,7 +316,7 @@ def test_a_store_without_nodata_or_mask_exports_neither(tmp_path):
     rasterio = pytest.importorskip("rasterio")
     truth = make_truth(3, 2, 40, 50)  # contains zeros, which are data here
     path = tmp_path / "store"
-    chronozarr.encode(make_da(truth, BANDS), path, nodata=None, chunk_size=16, anchor_interval=2)
+    chronozarr.encode(make_da(truth, BANDS), path, nodata=None, chunk_size=16)
     for t, tif in enumerate(export_cog(path, tmp_path / "cogs")):
         with rasterio.open(tif) as src:
             assert src.nodata is None
@@ -358,9 +354,7 @@ def test_physical_export_writes_float32_values_with_nan_where_invalid(tmp_path):
     rasterio = pytest.importorskip("rasterio")
     cogs = fx.nodata_zero(tmp_path)
     store_path = tmp_path / "store"
-    convert(
-        fx.write_manifest(tmp_path / "m.csv", cogs), store_path, chunk_size=16, anchor_interval=2
-    )
+    convert(fx.write_manifest(tmp_path / "m.csv", cogs), store_path, chunk_size=16)
     store = chronozarr.open_store(store_path)
     for t, tif in enumerate(export_cog(store, tmp_path / "out", physical=True)):
         with rasterio.open(tif) as src:
@@ -382,9 +376,7 @@ def test_physical_export_also_writes_the_mask_of_a_mask_store(tmp_path):
     rasterio = pytest.importorskip("rasterio")
     cogs = fx.scaled_masked(tmp_path)
     store_path = tmp_path / "store"
-    convert(
-        fx.write_manifest(tmp_path / "m.csv", cogs), store_path, chunk_size=16, anchor_interval=2
-    )
+    convert(fx.write_manifest(tmp_path / "m.csv", cogs), store_path, chunk_size=16)
     for t, tif in enumerate(export_cog(store_path, tmp_path / "out", physical=True)):
         with rasterio.open(tif) as src:
             assert np.array_equal(np.isnan(src.read()), ~cogs.valid[t])
@@ -397,9 +389,7 @@ def test_gdalinfo_reads_the_mask_scale_offset_and_unit_of_an_export(tmp_path):
     pytest.importorskip("rasterio")
     cogs = fx.scaled_masked(tmp_path)
     store_path = tmp_path / "store"
-    convert(
-        fx.write_manifest(tmp_path / "m.csv", cogs), store_path, chunk_size=16, anchor_interval=2
-    )
+    convert(fx.write_manifest(tmp_path / "m.csv", cogs), store_path, chunk_size=16)
     (tif,) = export_cog(store_path, tmp_path / "out", times=[1])
     out = subprocess.run(
         ["gdalinfo", "-json", str(tif)], check=True, capture_output=True, text=True

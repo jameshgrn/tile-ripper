@@ -23,8 +23,6 @@ CS = 8
 
 def _encode(tmp_path, truth, **kwargs):
     kwargs.setdefault("chunk_size", CS)
-    kwargs.setdefault("anchor_interval", 2)
-    kwargs.setdefault("encoding", "star-delta")
     chronozarr.encode(make_da(truth), tmp_path / "s", **kwargs)
     return chronozarr.open_store(tmp_path / "s")
 
@@ -150,8 +148,8 @@ def test_spec_chunk_sizes_write_a_conforming_store(tmp_path, chunk_size):
     assert np.array_equal(store.to_xarray().values, truth)
     assert chronozarr.validate(tmp_path / "s") == []
     assert {level.chunk_size for level in store.levels} == {chunk_size}
-    multiscale = zarr.open_group(str(tmp_path / "s"), mode="r").attrs["multiscales"][0]
-    assert all("pixels_per_tile" not in d for d in multiscale["datasets"])
+    multiscale = zarr.open_group(str(tmp_path / "s"), mode="r").attrs["multiscales"]
+    assert all("pixels_per_tile" not in d for d in multiscale["layout"])
 
 
 @pytest.mark.parametrize("chunk_size", [0, 1, 7, -4])
@@ -165,7 +163,7 @@ def test_chunk_size_must_be_even(tmp_path, chunk_size):
 
 def test_shard_time_splits_the_time_axis_into_several_shards(tmp_path):
     truth = make_truth(7, 2, 13, 11)
-    store = _encode(tmp_path, truth, shard=True, shard_time=3, anchor_interval=2)
+    store = _encode(tmp_path, truth, shard=True, shard_time=3)
     data = zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"]
     assert data.shards == (3, 2, CS, CS)
     assert data.chunks == (1, 2, CS, CS)
@@ -183,25 +181,23 @@ def test_shard_time_splits_the_time_axis_into_several_shards(tmp_path):
 
 
 def test_reads_span_shards_along_time(tmp_path):
-    # anchors 0, 4, 8; timestep 5 references anchor 4 which lives in shard 1 (t 3..5),
-    # timestep 7 references anchor 8 which lives in shard 2 (t 6..8): a delta from another shard.
+    # Read ordinary timesteps from three distinct time shards.
     truth = make_truth(9, 1, 13, 11)
-    _encode(tmp_path, truth, shard=True, shard_time=3, anchor_interval=4)
+    _encode(tmp_path, truth, shard=True, shard_time=3)
     counting = CountingStore(LocalStore(tmp_path / "s", read_only=True))
     store = chronozarr.open_store(counting)
     counting.reads.clear()
     cell = store.read_cell(7, 0, 0)
     assert np.array_equal(cell, truth[7, :, :8, :8])
     keys = {k for k, _ in counting.reads if "/data/c/" in k}
-    assert keys == {"0/data/c/2/0/0/0"}  # t=7 and its anchor 8 are both in time shard 2
+    assert keys == {"0/data/c/2/0/0/0"}  # t=7 is in time shard 2
     counting.reads.clear()
-    store.read_cell(5, 0, 0)  # delta in shard 1, anchor 4 in shard 1
+    store.read_cell(5, 0, 0)  # t=5 is in time shard 1
     assert {k for k, _ in counting.reads if "/data/c/" in k} == {"0/data/c/1/0/0/0"}
     counting.reads.clear()
-    cell = store.read_cell(6, 0, 0)  # delta in shard 2, nearest anchor 4 (tie, earlier) in shard 1
+    cell = store.read_cell(6, 0, 0)  # t=6 is in time shard 2
     assert np.array_equal(cell, truth[6, :, :8, :8])
     assert {k for k, _ in counting.reads if "/data/c/" in k} == {
-        "0/data/c/1/0/0/0",
         "0/data/c/2/0/0/0",
     }
 
@@ -220,7 +216,7 @@ def test_shard_index_has_shard_time_entries_even_in_a_partial_last_shard(tmp_pat
 
 def test_default_writes_plain_chunk_keys(tmp_path):
     truth = make_truth(3, 2, 13, 11)
-    store = _encode(tmp_path, truth, encoding="none")  # shard is not passed: the default
+    store = _encode(tmp_path, truth)  # shard is not passed: the default
     data = zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"]
     assert data.shards is None
     assert store.levels[0].shard_time is None
@@ -234,7 +230,7 @@ def test_default_writes_plain_chunk_keys(tmp_path):
 
 
 def test_shard_true_writes_one_object_per_time_shard_and_cell(tmp_path):
-    store = _encode(tmp_path, make_truth(3, 2, 13, 11), encoding="none", shard=True)
+    store = _encode(tmp_path, make_truth(3, 2, 13, 11), shard=True)
     base = tmp_path / "s" / "0" / "data" / "c"
     keys = {"/".join(p.relative_to(base).parts) for p in base.rglob("*") if p.is_file()}
     assert keys == {f"0/0/{r}/{c}" for r in range(2) for c in range(2)}  # all 3 timesteps in 1
@@ -375,7 +371,6 @@ def test_blosc_zstd_shuffle_codec(tmp_path, level, expected, shard):
         chunk_size=CS,
         codec="blosc-zstd-shuffle",
         level=level,
-        encoding="star-delta",
         shard=shard,
     )
     codecs = _inner_codecs(tmp_path / "s")
@@ -395,9 +390,7 @@ def test_zstd_level_changes_the_bytes_not_the_values(tmp_path):
     sizes = {}
     for level in (1, 19):
         out = tmp_path / f"l{level}"
-        report = chronozarr.encode(
-            make_da(truth), out, chunk_size=16, level=level, encoding="none", n_lods=1
-        )
+        report = chronozarr.encode(make_da(truth), out, chunk_size=16, level=level, n_lods=1)
         sizes[level] = report.total_bytes
         assert report.level == level
         assert np.array_equal(chronozarr.open_store(out).to_xarray().values, truth)
@@ -493,18 +486,6 @@ def test_gdal_crs_is_url_only_for_an_epsg_code_pyproj_does_not_know(tmp_path, mo
     _encode(tmp_path, make_truth(2, 1, 13, 11))
     crs = zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"].attrs["_CRS"]
     assert crs == {"url": EPSG_URL}
-
-
-def test_non_epsg_crs_gets_no_gdal_crs(tmp_path, monkeypatch):
-    _no_pyproj(monkeypatch)
-    truth = make_truth(2, 1, 13, 11)
-    chronozarr.encode(
-        make_da(truth), tmp_path / "s", chunk_size=CS, crs="ESRI:102003", encoding="none"
-    )
-    attrs = zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"].attrs.asdict()
-    assert "_CRS" not in attrs
-    assert attrs["proj:code"] == "ESRI:102003"
-    assert chronozarr.validate(tmp_path / "s") == []
 
 
 def test_validator_flags_a_gdal_crs_that_names_another_crs(tmp_path, monkeypatch):

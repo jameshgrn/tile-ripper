@@ -130,7 +130,7 @@ test('cancelling openStore aborts its initial metadata request without retries',
 });
 
 test('cancelling openStore aborts all outstanding array metadata reads', async () => {
-  const readable = buildSyntheticStore({ nTime: 2, nBand: 1, height: 32, width: 32, chunk: 32, encoding: 'none', sharded: false });
+  const readable = buildSyntheticStore({ nTime: 2, nBand: 1, height: 32, width: 32, chunk: 32, sharded: false });
   const abort = new AbortController();
   const signals = [];
   let arraysStarted;

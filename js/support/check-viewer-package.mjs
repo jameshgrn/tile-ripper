@@ -21,7 +21,7 @@ try {
   assert.deepEqual(JSON.parse(await readFile(path.join(output, 'demo/catalog.json'), 'utf8')), []);
   const imported = execFileSync(process.execPath, ['--input-type=module', '-e', "const {openStore}=await import('chronozarr'); if(typeof openStore!=='function') throw Error('missing reader')"], { cwd: temporary });
   assert.equal(imported.length, 0);
-  const files = buildSyntheticStore({ nTime: 3, nBand: 4, height: 64, width: 64, chunk: 64, anchorInterval: 2, sharded: false, consolidated: true, bands: ['B02', 'B03', 'B04', 'B08'] }).files;
+  const files = buildSyntheticStore({ nTime: 3, nBand: 4, height: 64, width: 64, chunk: 64, sharded: false, consolidated: true, bands: ['B02', 'B03', 'B04', 'B08'] }).files;
   for (const [key, bytes] of files) {
     const file = path.join(output, 'store', key.replace(/^\//, ''));
     await mkdir(path.dirname(file), { recursive: true });

@@ -1,9 +1,9 @@
 """Make a copy of a chronozarr store whose root zarr.json also lists `chronozarr.shard_bytes`.
 
-The copy is a directory of symlinks to the source store's objects plus its own root zarr.json, so a reader can be
+The copy links the source objects and has its own root zarr.json, so a reader can be
 measured with and without the length hint on identical data.
 
-Run: uv run python js/support/reader-bench/add_shard_bytes.py data/spike/stress6x6 data/spike/stress6x6_sb
+Run: uv run python js/support/reader-bench/add_shard_bytes.py SOURCE TARGET
 """
 
 import json
@@ -18,8 +18,8 @@ def main(source: Path, dest: Path) -> None:
     cz = root["attributes"]["chronozarr"]
     variable = cz.get("variable", "data")
     shard_bytes: dict[str, dict[str, int]] = {}
-    for dataset in root["attributes"]["multiscales"][0]["datasets"]:
-        level = dataset["path"]
+    for dataset in root["attributes"]["multiscales"]["layout"]:
+        level = dataset["asset"]
         shard_dir = source / level / variable / "c"
         sizes: dict[str, int] = {}
         for shard in sorted(shard_dir.rglob("*")):

@@ -2,7 +2,7 @@
 //
 // Data path: the store reader (js/chronozarr/decoder.js) fetches and decodes raw chunks of the store's data type
 // (uint8, uint16, int16 or float32); this layer uploads them unchanged into one texture array and the fragment
-// shader reconstructs star-delta timesteps and runs the product band math (see shader.js). Each cell is drawn as a
+// shader reads true values and runs the product band math (see shader.js). Each cell is drawn as a
 // small mesh whose vertices were projected from the store CRS to Web Mercator in float64 (mesh.js), so the warp
 // costs nothing per pixel.
 //
@@ -242,7 +242,7 @@ export class ChronozarrLayer {
    * {t, time, col, row, lngLat (pixel centre), x, y (store CRS), valid, bands: [{name, units, reflectance, stored, value}], ndvi, ndwi, isWater}.
    * `stored` is the stored number and `value` is stored * scale + offset; `valid` follows the mask when the store has one, else the nodata value.
    * Resolves null outside the store's footprint.
-   * Fetches the level-0 chunks when they are not cached (an anchor and a delta at most).
+   * Fetches the level-0 chunks when they are not cached (one data chunk per cell).
    */
   async getValueAt(lngLat, { t = this.#t } = {}) {
     const store = await this.#opened;
@@ -257,8 +257,7 @@ export class ChronozarrLayer {
     if (!(col >= 0 && row >= 0 && col < level.width && row < level.height)) return null;
     const cellRow = Math.floor(row / level.chunkHeight);
     const cellCol = Math.floor(col / level.chunkWidth);
-    const anchorT = store.anchorOf(t);
-    await Promise.all([store.getRaw(0, cellRow, cellCol, anchorT), anchorT === t ? null : store.getRaw(0, cellRow, cellCol, t)]);
+    await store.getRaw(0, cellRow, cellCol, t);
     const offsetX = col - cellCol * level.chunkWidth;
     const offsetY = row - cellRow * level.chunkHeight;
     let values = store.samplePixel(0, cellRow, cellCol, t, offsetX, offsetY);
@@ -430,7 +429,7 @@ export class ChronozarrLayer {
       throw new Error(`ChronozarrLayer: shader link failed: ${log}`);
     }
     const uniforms = {};
-    for (const name of ['u_matrix', 'u_data', 'u_mask', 'u_extent', 'u_anchorBase', 'u_deltaBase', 'u_maskLayer', 'u_inputs', 'u_product', 'u_display', 'u_range', 'u_stretchLo', 'u_hasNodata', 'u_nodata', 'u_opacity', 'u_scale', 'u_divisor', 'u_offset']) {
+    for (const name of ['u_matrix', 'u_data', 'u_mask', 'u_extent', 'u_dataBase', 'u_maskLayer', 'u_inputs', 'u_product', 'u_display', 'u_range', 'u_stretchLo', 'u_hasNodata', 'u_nodata', 'u_opacity', 'u_scale', 'u_divisor', 'u_offset']) {
       uniforms[name] = gl.getUniformLocation(program, name);
     }
     return { program, uniforms, attributes: { pos: gl.getAttribLocation(program, 'a_pos'), texel: gl.getAttribLocation(program, 'a_texel') }, texture: null, maskTexture: null, pool: null, maskPool: null, indexBuffer: null };
@@ -460,7 +459,7 @@ export class ChronozarrLayer {
     const slotBytes = nBand * chunkWidth * chunkHeight * format.Array.BYTES_PER_ELEMENT;
     const maxLayers = gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS);
     const slots = Math.min(Math.floor(this.#options.gpuBudgetBytes / slotBytes), Math.floor(maxLayers / nBand));
-    if (slots < 2) throw new Error(`ChronozarrLayer: the GPU budget (${this.#options.gpuBudgetBytes} bytes, ${maxLayers} array layers available) holds ${slots} chunk slots of ${slotBytes} bytes; at least 2 are needed (anchor + delta). Raise gpuBudgetBytes.`);
+    if (slots < 1) throw new Error(`ChronozarrLayer: the GPU budget (${this.#options.gpuBudgetBytes} bytes, ${maxLayers} array layers available) holds ${slots} chunk slots of ${slotBytes} bytes; at least 1 is needed. Raise gpuBudgetBytes.`);
     if (chunkWidth > gl.getParameter(gl.MAX_TEXTURE_SIZE)) throw new Error(`ChronozarrLayer: chunks are ${chunkWidth} px wide, more than this GPU's MAX_TEXTURE_SIZE`);
     gl.getError(); // clears one error left by earlier code, so the check below reports our own
     gpu.texture = this.#allocateTexture(gl[format.internal], chunkWidth, chunkHeight, slots * nBand);
@@ -722,24 +721,18 @@ export class ChronozarrLayer {
   }
 
   /**
-   * Anchor, delta and (when the store has one) mask slots for a cell at timestep t, or null while any is missing.
+   * Data and (when the store has one) mask slots for a cell at timestep t, or null while any is missing.
    * `load` uploads chunks that the reader has cached but the GPU does not hold.
    */
   #slotsFor(lod, row, col, t, load) {
-    const anchorT = this.#store.anchorOf(t);
-    const anchor = this.#resident(lod, row, col, anchorT, load);
-    if (anchor < 0) return null;
-    let delta = -1;
-    if (anchorT !== t) {
-      delta = this.#resident(lod, row, col, t, load);
-      if (delta < 0) return null;
-    }
+    const data = this.#resident(lod, row, col, t, load);
+    if (data < 0) return null;
     let mask = -1;
     if (this.#store.hasMask) {
       mask = this.#residentMask(lod, row, col, t, load);
       if (mask < 0) return null;
     }
-    return { anchor, delta, mask };
+    return { data, mask };
   }
 
   /** Whether this frame may upload another chunk; if not, another frame is scheduled for the rest. */
@@ -885,8 +878,7 @@ export class ChronozarrLayer {
       originMatrix(matrix, mesh.origin, this.#scratchMatrix);
       gl.uniformMatrix4fv(uniforms.u_matrix, false, this.#scratchMatrix);
       gl.uniform2f(uniforms.u_extent, item.extent.width, item.extent.height);
-      gl.uniform1i(uniforms.u_anchorBase, item.slots.anchor * gpu.slotLayers);
-      gl.uniform1i(uniforms.u_deltaBase, item.slots.delta < 0 ? -1 : item.slots.delta * gpu.slotLayers);
+      gl.uniform1i(uniforms.u_dataBase, item.slots.data * gpu.slotLayers);
       gl.uniform1i(uniforms.u_maskLayer, item.slots.mask);
       gl.bindVertexArray(mesh.vao);
       gl.drawElements(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_SHORT, 0);
@@ -904,9 +896,7 @@ export class ChronozarrLayer {
     if (failedAt !== undefined && performance.now() - failedAt < FAILURE_COOLDOWN_MS) return;
     const store = this.#store;
     const { signal } = this.#controller;
-    const anchorT = store.anchorOf(t);
-    const reads = [store.getRaw(lod, row, col, anchorT, { signal })];
-    if (anchorT !== t) reads.push(store.getRaw(lod, row, col, t, { signal }));
+    const reads = [store.getRaw(lod, row, col, t, { signal })];
     if (store.hasMask) reads.push(store.getMask(lod, row, col, t, { signal }));
     this.#pending.add(key);
     Promise.all(reads).then(

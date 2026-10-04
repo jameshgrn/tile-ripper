@@ -243,7 +243,8 @@ class Plan:
             f"data:       {info.n_band} bands ({', '.join(info.band_names)}), {info.dtype.name}",
             "scaling:    "
             + ", ".join(
-                f"{b.name} = stored * {b.scale:g} {b.offset:+g}"
+                f"{b.name} = stored * {1.0 if b.scale is None else b.scale:g} "
+                f"{0.0 if b.offset is None else b.offset:+g}"
                 + (f" [{b.units}]" if b.units else "")
                 for b in info.bands
             ),
@@ -265,7 +266,7 @@ class Plan:
                 f"output:     about {self.est_output_bytes / 1e9:.2f} GB in "
                 f"{self.n_levels} levels "
                 f"(zstd 5 ratio {self.sample_ratio:.2f} on {len(self.samples) or SAMPLE_TIMESTEPS}"
-                " sampled cells, before any star-delta saving)"
+                " sampled cells)"
             )
         if self.sample_read_s is not None:
             out.append(
@@ -342,18 +343,40 @@ def plan_conversion(
             bounds=frame_bounds,
         )
     else:
+        from chronozarr._convert_legacy import LegacySource, legacy_metadata
+
+        metadata = legacy_metadata(source_path)
+        if metadata is not None:
+            source = LegacySource(source_path)
+            if (
+                any(
+                    v is not None
+                    for v in (variable, dims, crs, transform, shape, resampling, mask_var, bounds)
+                )
+                or nodata != "auto"
+            ):
+                raise ValueError(
+                    "legacy migration preserves source metadata; input overrides are forbidden"
+                )
         if transform is not None or shape is not None or resampling is not None or bounds:
             raise ValueError(
                 "--transform, --shape, --bounds and --resampling apply to manifests of COGs or "
                 "image frames; a Zarr or NetCDF input keeps the grid of its x/y coordinates "
                 "(--crs only declares its CRS)"
             )
-        source = XarraySource(text, variable, _parse_dims(dims), crs, nodata, mask_var)
+        if metadata is None:
+            source = XarraySource(text, variable, _parse_dims(dims), crs, nodata, mask_var)
 
     info = source.info
     n_time = len(source.times)
     timestep_bytes = info.n_band * info.grid.height * info.grid.width * info.dtype.itemsize
-    shapes = schema.level_shapes(info.grid.height, info.grid.width, chunk_size, n_lods)
+    from chronozarr._convert_legacy import LegacySource
+
+    shapes = (
+        [tuple(a.shape[2:]) for a in source.data]
+        if isinstance(source, LegacySource)
+        else schema.level_shapes(info.grid.height, info.grid.width, chunk_size, n_lods)
+    )
     pyramid = sum(h * w for h, w in shapes) / (info.grid.height * info.grid.width)
     plan = Plan(
         source=source,
@@ -563,8 +586,8 @@ def convert(
     `on_plan` receives the `Plan` (sizes, estimates) before any data is staged; `dry_run` stops
     there. Timesteps are staged under `work_dir` (default `<out>.convert-work` beside `out`):
     it is removed on success and kept on failure, and `resume=True` reuses its timesteps.
-    `encode_options` go to `chronozarr.encode`: chunk_size, encoding, codec, level,
-    anchor_interval, shard, shard_time, n_lods, workers, provenance.
+    `encode_options` go to `chronozarr.encode`: chunk_size, codec, level, volatility,
+    shard, shard_time, n_lods, workers, provenance.
     """
     if read_ahead < 1:
         raise ValueError(f"read_ahead must be >= 1, got {read_ahead}")
@@ -592,6 +615,29 @@ def convert(
         on_plan(plan)
     if dry_run:
         return ConvertReport(plan, None, 0, 0, 0.0, 0.0)
+
+    from chronozarr._convert_legacy import LegacySource, migrate
+
+    if isinstance(plan.source, LegacySource):
+        if encode_options:
+            # CLI passes writer defaults; migrations preserve the source layout and codecs.
+            defaults = {
+                "chunk_size": 512,
+                "codec": "zstd",
+                "level": None,
+                "volatility": False,
+                "shard": False,
+                "shard_time": None,
+                "n_lods": None,
+                "workers": None,
+            }
+            if any(k not in defaults or v != defaults[k] for k, v in encode_options.items()):
+                raise ValueError(
+                    "legacy migration preserves chunks; writer overrides are forbidden"
+                )
+        started = time.perf_counter()
+        report = migrate(plan.source, out_path, progress)
+        return ConvertReport(plan, report, 0, 0, 0, time.perf_counter() - started)
 
     work = (
         Path(work_dir)

@@ -201,6 +201,8 @@ def _resolve_transform(raw: Sequence[float] | None, da: xr.DataArray | None) -> 
     values = [float(v) for v in list(raw)[:6]]
     if len(values) != 6:
         raise ValueError(f"transform needs 6 coefficients (a, b, c, d, e, f), got {raw!r}")
+    if not all(math.isfinite(v) for v in values):
+        raise ValueError("transform coefficients must be finite")
     a, b, _, d, e, _ = values
     if b != 0 or d != 0:
         raise ValueError("rotated transforms are not supported; reproject to a north-up grid")
@@ -263,7 +265,7 @@ def _resolve_nodata(
     if nodata == "default":
         if has_mask:
             return None
-        return schema.NODATA if dtype.name in schema.TEMPORAL_DTYPES else None
+        return schema.NODATA if dtype.name in ("uint8", "uint16") else None
     if nodata is None:
         return None
     if isinstance(nodata, bool) or not isinstance(nodata, int | float | np.number):
@@ -562,11 +564,13 @@ def _write_time_coord(group: zarr.Group, times_ms: np.ndarray, *, overwrite: boo
     )
 
 
-def _shard_bytes(out: Path, n_levels: int) -> dict[str, dict[str, int]]:
+def _shard_bytes(
+    out: Path, n_levels: int, variable: str = schema.VARIABLE
+) -> dict[str, dict[str, int]]:
     """Byte length of every shard object of the data array, keyed by level then t/row/col."""
     sizes: dict[str, dict[str, int]] = {}
     for k in range(n_levels):
-        base = out / str(k) / schema.VARIABLE / "c"
+        base = out / str(k) / variable / "c"
         entries = {}
         for path in sorted(base.glob("*/0/*/*")):
             t_shard, _, row, col = path.relative_to(base).parts
@@ -744,3 +748,21 @@ def _spill_timesteps(
     if seen != n_time:
         raise ValueError(f"the input has {seen} timesteps but times has {n_time}")
     return spill
+
+
+def _mean_comparison(block: np.ndarray, reference: Mapping[int, int]) -> tuple[float, int]:
+    """Sum of exact absolute differences over the nominal comparison timesteps."""
+    wide = np.float64 if block.dtype.kind == "f" else np.int32
+    by_comparison: dict[int, list[int]] = {}
+    for t, comparison in reference.items():
+        by_comparison.setdefault(comparison, []).append(t)
+    total = 0.0
+    count = 0
+    for comparison, steps in by_comparison.items():
+        base = block[comparison].astype(wide)
+        for t in steps:
+            diff = block[t].astype(wide)
+            diff -= base
+            total += float(np.abs(diff).sum(dtype=np.float64))
+            count += diff.size
+    return total, count

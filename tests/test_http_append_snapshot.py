@@ -26,8 +26,6 @@ def test_http_append_snapshot_with_uncached_older_frames(tmp_path, sharded):
         published,
         chunk_size=16,
         n_lods=1,
-        encoding="star-delta",
-        anchor_interval=6,
         shard=sharded,
         **({"shard_time": 4} if sharded else {}),
     )

@@ -1,5 +1,7 @@
 # Clean-checkout adoption reproduction
 
+Historical v0.2 results and artifacts below are preserved as recorded. They do not describe v0.3 writer options; use explicit conversion before reading the stores with v0.3.
+
 Verified 2026-10-02 from a new local clone of commit `2c04bfd`, with a new virtual
 environment and freshly downloaded inputs. No existing project data or developer virtual
 environment was copied. This was the project's agent on the same machine, not an outside user.

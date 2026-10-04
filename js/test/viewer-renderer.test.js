@@ -11,17 +11,16 @@ test('the product GLSL defines shade() and shadeLinear() with stable signatures,
   assert.ok(PRODUCTS.every((p, i) => p.shader === i), 'shader numbers are the product positions the GLSL branches on');
 });
 
-test('each data type gets a fragment shader with its sampler, the shared product code, and no other delta arithmetic', () => {
+test('each data type gets a fragment shader with its sampler, the shared product code, and direct true-value reads', () => {
   for (const [dtype, format] of Object.entries(TEXTURE_FORMATS)) {
     const source = fragmentShader(dtype);
     assert.ok(source.startsWith('#version 300 es'), dtype);
     assert.ok(source.includes(`uniform ${format.sampler} u_data;`), dtype);
     assert.ok(source.includes(PRODUCT_GLSL), `${dtype} includes the product code unchanged`);
     assert.match(source, /shade\(u_product, x, u_stretch_lo\)/);
-    assert.equal(source.includes('& ') && source.includes('(a + d)'), format.delta !== null, `${dtype}: only unsigned types add a delta`);
+    assert.doesNotMatch(source, /u_deltaBase|u_anchorBase|a \+ d/);
+    assert.match(source, /u_dataBase \+ band/);
   }
-  assert.match(fragmentShader('uint8'), /\(a \+ d\) & 255u/, 'modular residual at 8 bits');
-  assert.match(fragmentShader('uint16'), /\(a \+ d\) & 65535u/, 'modular residual at 16 bits');
   assert.match(fragmentShader('float32'), /isnan\(v\)/, 'NaN is nodata in float data');
   assert.doesNotMatch(fragmentShader('uint16'), /isnan/);
 });

@@ -1,5 +1,9 @@
 # Measured comparisons: zarr-layer, and one COG per date
 
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
+
+The measurements below describe historical v0.2 artifacts, not current writer options. Convert those stores before opening them with v0.3 libraries.
+
 > Historical benchmark: the results below were measured on sharded dataset revision `chronozarr-3` on 2026-10-01. The current demo catalog uses unsharded `chronozarr-4`; these suffixes are store-prefix revisions, not format versions. Historical results and procedures are retained as measured. See the README for the subsequent unsharded cold-open measurement.
 
 For the matched three-date level-0 sample measured on 2026-10-03, see the
@@ -44,7 +48,7 @@ Raw output: `bench/results/zarr-layer-probe-as-published.json`, `...-crs-and-bou
 
 ### 1.2 Change to the store attributes
 
-**Status (2026-10-01).** Adopted, in a follow-up to the measurement below (which tested it without touching the published store). `spec/CHRONOZARR.md` sections 2.1, 3.4 and 13 now say writers MUST NOT write `pixels_per_tile` and readers MUST ignore it; `spec_version` stays 0.2.0. The writer (`encode`, `append` leaves an existing `multiscales` alone), the Python reader (the cell size is the chunk shape of the data array) and the validator (accepts a store with or without the key) follow it, and `chronozarr doctor` prints one info line for a remote store that still carries the key. Stores written earlier stay valid and open in zarr-layer with the `crs` and `bounds` options. The root `zarr.json` of `ucayali_santa_maria/chronozarr-3` and `ucayali_santa_maria/water-1` was rewritten locally without the key (the only difference from the published roots is the four removed keys per store); the published copies carry it until those two files are uploaded. The JS reader (`js/chronozarr/decoder.js` line 408) still rejects a `pixels_per_tile` that disagrees with the chunk shape, which is stricter than "readers MUST ignore it"; not changed here.
+**Status (2026-10-01).** Adopted, in a follow-up to the measurement below (which tested it without touching the published store). `spec/CHRONOZARR.md` sections 2.1, 3.4 and 13 now say writers MUST NOT write `pixels_per_tile` and readers MUST ignore it; the historical `spec_version` stayed 0.2.0. The writer (`encode`, `append` leaves an existing `multiscales` alone), the Python reader (the cell size is the chunk shape of the data array) and the validator (accepts a store with or without the key) follow it, and `chronozarr doctor` prints one info line for a remote store that still carries the key. Stores written earlier stay valid and open in zarr-layer with the `crs` and `bounds` options. The root `zarr.json` of `ucayali_santa_maria/chronozarr-3` and `ucayali_santa_maria/water-1` was rewritten locally without the key (the only difference from the published roots is the four removed keys per store); the published copies carry it until those two files are uploaded. The JS reader (`js/chronozarr/decoder.js` line 408) still rejects a `pixels_per_tile` that disagrees with the chunk shape, which is stricter than "readers MUST ignore it"; not changed here.
 
 The text below is the proposal as measured.
 

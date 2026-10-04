@@ -1,4 +1,6 @@
-"""Measure what appending one date to a chronozarr store costs, on real monthly mosaics.
+"""Historical v0.2 benchmark: run with a pinned v0.2 checkout/environment.
+
+Measure what appending one date to a chronozarr store costs, on real monthly mosaics.
 
 Reads data/mosaics/<aoi>/YYYY-MM.npz (the files `reencode_aoi.py` reads). For each layout
 (whole-axis shard, shard_time=12, unsharded) and encoding (auto, star-delta) it builds a store

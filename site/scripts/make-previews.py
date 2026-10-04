@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
 import chronozarr
 
 ROOT = Path(__file__).resolve().parents[2]

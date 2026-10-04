@@ -4,7 +4,7 @@ import { FetchError, openStore } from '../chronozarr/decoder.js';
 import { buildSyntheticStore } from '../support/synthetic-store.js';
 import { filesFetch } from '../support/files-fetch.js';
 
-const SPEC = { nTime: 6, nBand: 1, height: 40, width: 40, chunk: 32, anchorInterval: 3, sharded: false };
+const SPEC = { nTime: 6, nBand: 1, height: 40, width: 40, chunk: 32,  sharded: false };
 const URL_BASE = 'https://example.test/store';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const isChunk = (key, t, cell = '0/0') => key.endsWith(`/c/${t}/0/${cell}`);

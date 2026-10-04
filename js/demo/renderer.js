@@ -2,13 +2,12 @@
 //
 // All chunks live as raw values of the store's data type in one TEXTURE_2D_ARRAY (R8UI, R16UI, R16I or R32F,
 // see TEXTURE_FORMATS). A chunk (band, y, x) occupies n_band consecutive layers ("slot"), so uploading one is a
-// single texSubImage3D from the decoded array. The fragment shader reads the anchor slot and, for delta
-// timesteps, the delta slot and adds them per pixel, so switching timesteps or products never runs a CPU loop
+// single texSubImage3D from the decoded array. The fragment shader reads one true-value slot,
+// so switching timesteps or products never runs a CPU loop
 // over pixels. The product colors come from products-glsl.js.
 //
 // A store with a validity mask (spec 2.4) gets a second TEXTURE_2D_ARRAY (R8UI) with one layer per slot. The mask
-// belongs to a timestep, so layer s holds the mask of the timestep whose data chunk sits in slot s: a delta
-// timestep is drawn with the mask layer of its delta slot, an anchor timestep with that of its anchor slot. Where
+// belongs to a timestep, so layer s holds the mask of the timestep whose data chunk sits in slot s. Where
 // the mask is 0 the shader writes the background color (opaque, so painting over the previous frame cannot leave
 // the previous timestep's pixel behind), and the store's nodata value is not compared (spec 2.3).
 
@@ -19,22 +18,11 @@ export { TEXTURE_FORMATS } from '../shared/texture-formats.js';
 
 const BACKGROUND = [0.035, 0.047, 0.071];
 
-function valueGlsl({ sampler, delta }, dtype) {
-  if (delta === null) {
-    return `
-float value(ivec2 texel, int band) {
-  if (band < 0) return 0.0;
-  return float(texelFetch(u_data, ivec3(texel, u_anchorBase + band), 0).r);
-}`;
-  }
+function valueGlsl() {
   return `
-// star-delta: value = (anchor + residual) mod 2^bits
 float value(ivec2 texel, int band) {
   if (band < 0) return 0.0;
-  uint a = texelFetch(u_data, ivec3(texel, u_anchorBase + band), 0).r;
-  if (u_deltaBase < 0) return float(a);
-  uint d = texelFetch(u_data, ivec3(texel, u_deltaBase + band), 0).r;
-  return float((a + d) & ${delta}u);
+  return float(texelFetch(u_data, ivec3(texel, u_dataBase + band), 0).r);
 }`;
 }
 
@@ -65,8 +53,7 @@ in vec2 v_texel;
 uniform ${format.sampler} u_data;
 ${hasMask ? 'uniform usampler2DArray u_mask;   // validity mask, one layer per slot: 1 = valid\nuniform int u_maskLayer;        // layer of the slot that holds the mask of the timestep on screen' : ''}
 uniform vec2 u_extent;
-uniform int u_anchorBase;   // first layer of the anchor slot
-uniform int u_deltaBase;    // first layer of the delta slot; -1 when the timestep is itself an anchor
+uniform int u_dataBase;     // first layer of the true-value data slot
 uniform ivec3 u_inputs;     // band index per product input, -1 = unused
 uniform int u_product;
 uniform int u_display;      // 0 = tone-mapped reflectance, 1 = linear stretch of u_range
@@ -80,7 +67,7 @@ uniform vec3 u_offset;
 out vec4 outColor;
 
 const vec3 BG = vec3(${BACKGROUND.join(', ')});
-${valueGlsl(format, dtype)}
+${valueGlsl()}
 
 bool isNodata(float v) {
   return (u_hasNodata != 0 && v == u_nodata)${isFloat ? ' || isnan(v)' : ''};
@@ -125,7 +112,7 @@ function compile(gl, type, source) {
   return shader;
 }
 
-const UNIFORM_NAMES = ['u_canvas', 'u_view', 'u_cell', 'u_extent', 'u_data', 'u_mask', 'u_maskLayer', 'u_anchorBase', 'u_deltaBase', 'u_inputs', 'u_product', 'u_display', 'u_range', 'u_stretch_lo', 'u_hasNodata', 'u_nodata', 'u_scale', 'u_divisor', 'u_offset'];
+const UNIFORM_NAMES = ['u_canvas', 'u_view', 'u_cell', 'u_extent', 'u_data', 'u_mask', 'u_maskLayer', 'u_dataBase', 'u_inputs', 'u_product', 'u_display', 'u_range', 'u_stretch_lo', 'u_hasNodata', 'u_nodata', 'u_scale', 'u_divisor', 'u_offset'];
 
 export class Renderer {
   #gl;
@@ -213,7 +200,7 @@ export class Renderer {
     if (chunkWidth > this.limits.maxSize || chunkHeight > this.limits.maxSize) {
       throw new Error(`Chunk ${chunkWidth}x${chunkHeight} exceeds MAX_TEXTURE_SIZE ${this.limits.maxSize}.`);
     }
-    if (slots < 2) throw new Error(`Texture pool has ${slots} slots; at least 2 are needed (anchor + delta).`);
+    if (slots < 1) throw new Error(`Texture pool has ${slots} slots; at least 1 is needed.`);
     if (this.#texture) gl.deleteTexture(this.#texture);
     this.#texture = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0);
@@ -384,16 +371,14 @@ export class Renderer {
 
   /**
    * Draw one cell. `world` = {x, y, w, h} in level-0 pixels; `extent` = valid texels {w, h}.
-   * `deltaSlot` is -1 when the timestep is an anchor. `maskSlot` is the slot holding the mask of the timestep
-   * (its delta slot, or its anchor slot for an anchor); only read when the pool has a mask.
+   * `dataSlot` holds the true-value chunk; `maskSlot` holds its validity mask when present.
    */
-  drawCell(world, extent, anchorSlot, deltaSlot, maskSlot = -1) {
+  drawCell(world, extent, dataSlot, maskSlot = -1) {
     const gl = this.#gl;
     const nBand = this.#pool.nBand;
     gl.uniform4f(this.#uniforms.u_cell, world.x, world.y, world.w, world.h);
     gl.uniform2f(this.#uniforms.u_extent, extent.w, extent.h);
-    gl.uniform1i(this.#uniforms.u_anchorBase, anchorSlot * nBand);
-    gl.uniform1i(this.#uniforms.u_deltaBase, deltaSlot < 0 ? -1 : deltaSlot * nBand);
+    gl.uniform1i(this.#uniforms.u_dataBase, dataSlot * nBand);
     if (this.#hasMask) {
       if (maskSlot < 0 || !this.hasMaskAt(maskSlot)) throw new Error(`drawCell: slot ${maskSlot} holds no validity mask; upload it with uploadMask first.`);
       gl.uniform1i(this.#uniforms.u_maskLayer, maskSlot);

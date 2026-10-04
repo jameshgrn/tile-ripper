@@ -1,5 +1,7 @@
 # Bounded browser delivery comparison
 
+Historical v0.2 results and artifacts below are preserved as recorded. They do not describe v0.3 writer options; use explicit conversion before reading the stores with v0.3.
+
 Run from the repository root after preparing the documented `examples/bring_your_data`
 Lake Mead sample and installing the existing bench dependencies:
 

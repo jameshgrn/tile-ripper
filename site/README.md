@@ -50,7 +50,7 @@ Verified 2026-10-02 (America/New_York):
   overflow at 390 px; homepage reviewed at desktop and mobile sizes.
 - Internal page/file links and fragment anchors pass.
 - Synthetic quickstart roundtrip, validator, xarray backend, and plain Zarr read pass.
-- Live homepage and docs load; search for star-delta returns specification results.
+- Live homepage and docs load; search returns specification results (historical v0.2 deployment check).
 - Unknown live paths return 404; www returns 301 to the apex while preserving path.
 - PyPI and npm both report chronozarr 0.2.1.
 

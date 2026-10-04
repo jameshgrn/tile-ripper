@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import json
 import time
 import urllib.error
 import urllib.request
@@ -11,8 +12,15 @@ from collections.abc import AsyncIterator, Iterable
 from typing import Any
 from urllib.parse import quote
 
-from zarr.abc.store import ByteRequest, OffsetByteRequest, RangeByteRequest, Store
+from zarr.abc.store import (
+    ByteRequest,
+    OffsetByteRequest,
+    RangeByteRequest,
+    Store,
+    SuffixByteRequest,
+)
 from zarr.core.buffer import Buffer, BufferPrototype
+from zarr.storage import LocalStore, WrapperStore
 
 # --- HTTP reading without fsspec --------------------------------------------------------------
 
@@ -153,3 +161,131 @@ def as_store(path_or_url: Any) -> Any:
     if isinstance(path_or_url, str) and path_or_url.startswith(("http://", "https://")):
         return HttpStore(path_or_url)
     return path_or_url
+
+
+class IndexStore(WrapperStore):
+    """Cache shard index bytes, retaining freshness for the mutable trailing time shard.
+
+    The upstream sharding codec owns index representation and decoding. This wrapper only
+    caches its index byte requests and turns HTTP suffix reads into bounded ranges.
+    """
+
+    def __init__(self, store: Store) -> None:
+        super().__init__(store)
+        self.indices: dict[str, tuple[int, str, int, dict[str, int]]] = {}
+        self.cache: dict[str, tuple[object, bytes]] = {}
+        self.locks: dict[str, asyncio.Lock] = {}
+
+    def configure(
+        self,
+        prefix: str,
+        size: int,
+        location: str,
+        mutable_time_shard: int,
+        lengths: dict[str, int],
+    ) -> None:
+        self.indices[prefix] = size, location, mutable_time_shard, lengths
+
+    def invalidate_indices(self) -> None:
+        self.cache.clear()
+
+    async def get(
+        self, key: str, prototype: BufferPrototype, byte_range: ByteRequest | None = None
+    ) -> Buffer | None:
+        config = next((v for prefix, v in self.indices.items() if key.startswith(prefix)), None)
+        if config is None or byte_range is None:
+            result = await self._store.get(key, prototype, byte_range)
+            if result is not None and key.endswith("zarr.json"):
+                metadata = json.loads(result.to_bytes())
+                check_extensions(metadata)
+                result = prototype.buffer.from_bytes(json.dumps(metadata).encode())
+            return result
+        size, location, mutable, lengths = config
+        index_request = (
+            location == "end"
+            and isinstance(byte_range, SuffixByteRequest)
+            and byte_range.suffix == size
+        ) or (
+            location == "start"
+            and isinstance(byte_range, RangeByteRequest)
+            and byte_range.start == 0
+            and byte_range.end == size
+        )
+        if not index_request:
+            return await self._store.get(key, prototype, byte_range)
+        lock = self.locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            # The first key component below c/ is the time shard in both array layouts.
+            time_shard = int(key.split("/c/", 1)[1].split("/", 1)[0])
+            underlying = self._store
+            while hasattr(underlying, "_store"):
+                underlying = underlying._store
+            length = lengths.get(key)
+            token: object = None
+            if time_shard == mutable:
+                if isinstance(underlying, HttpStore):
+                    head = await asyncio.to_thread(underlying._fetch, key, "HEAD")
+                    if head is None:
+                        self.cache.pop(key, None)
+                        return None
+                    headers = head[1]
+                    length = int(headers["Content-Length"])
+                    version = headers.get("ETag") or headers.get("Last-Modified")
+                    token = (length, version) if version else object()
+                elif isinstance(underlying, LocalStore):
+                    try:
+                        stat = (underlying.root / key).stat()
+                    except FileNotFoundError:
+                        self.cache.pop(key, None)
+                        return None
+                    length, token = stat.st_size, (stat.st_size, stat.st_mtime_ns)
+                else:
+                    # Without a version signal, refetch this mutable index rather than risk
+                    # applying cached offsets to replacement bytes of the same length.
+                    length, token = await self._store.getsize(key), object()
+            cached = self.cache.get(key)
+            if cached is not None and cached[0] == token:
+                return prototype.buffer.from_bytes(cached[1])
+            request = byte_range
+            if isinstance(underlying, HttpStore) and location == "end":
+                if length is None:
+                    try:
+                        length = await self._store.getsize(key)
+                    except FileNotFoundError:
+                        return None
+                request = RangeByteRequest(length - size, length)
+            result = await self._store.get(key, prototype, request)
+            if result is not None:
+                self.cache[key] = token, result.to_bytes()
+            return result
+
+
+def check_extensions(metadata: dict[str, Any]) -> None:
+    """Reject unknown required Zarr metadata extensions, including consolidated nodes."""
+    group_keys = {"zarr_format", "node_type", "attributes", "consolidated_metadata"}
+    array_keys = {
+        "zarr_format",
+        "node_type",
+        "attributes",
+        "shape",
+        "data_type",
+        "chunk_grid",
+        "chunk_key_encoding",
+        "fill_value",
+        "codecs",
+        "dimension_names",
+        "storage_transformers",
+    }
+    if metadata.get("storage_transformers"):
+        raise ValueError("unsupported storage_transformers")
+    known = group_keys if metadata.get("node_type") == "group" else array_keys
+    for name, value in list(metadata.items()):
+        if name not in known and not (
+            isinstance(value, dict) and value.get("must_understand") is False
+        ):
+            raise ValueError(f"unsupported mandatory Zarr extension {name!r}")
+        if name not in known and metadata.get("node_type") == "group":
+            metadata.pop(name)
+    consolidated = metadata.get("consolidated_metadata", {})
+    for node in consolidated.get("metadata", {}).values():
+        check_extensions(node)

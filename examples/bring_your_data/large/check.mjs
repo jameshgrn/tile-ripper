@@ -48,7 +48,7 @@ try {
         }
         peakReaderBytes = Math.max(peakReaderBytes, store.stats().cache.usedBytes);
       }
-      frames.push({ t, data: await digest(data.buffer), mask: await digest(mask.buffer), anchor: store.isAnchor(t), cache: store.stats().cache });
+      frames.push({ t, data: await digest(data.buffer), mask: await digest(mask.buffer), cache: store.stats().cache });
     }
     const stats = store.stats();
     store.close();

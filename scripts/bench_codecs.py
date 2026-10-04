@@ -5,7 +5,7 @@ Each setting encodes the same months into a temporary store (deleted afterwards)
 
 Usage:
     uv run python scripts/bench_codecs.py                       # Ucayali, all months, 4 settings
-    uv run python scripts/bench_codecs.py --months 24 --encodings none
+    uv run python scripts/bench_codecs.py --months 24
     uv run python scripts/bench_codecs.py --codecs zstd:1,zstd:5,blosc-zstd-shuffle:1
 """
 
@@ -40,13 +40,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--aoi", default="ucayali_santa_maria")
     parser.add_argument("--months", type=int, default=None, help="use only the first N months")
-    parser.add_argument("--encodings", default="none,star-delta", help="comma separated")
+    parser.add_argument("--encodings", default="none", help="comma separated")
     parser.add_argument("--codecs", default="zstd:5,blosc-zstd-shuffle:1")
     parser.add_argument("--workers", type=int, default=None, help="cells encoded concurrently")
     parser.add_argument("--tmp-dir", type=Path, default=None, help="where the temp stores go")
     args = parser.parse_args()
 
     encodings = args.encodings.split(",")
+    if encodings != ["none"]:
+        parser.error("v0.3 supports only true values (--encodings none)")
     settings = parse_codecs(args.codecs)
     paths = mosaic_paths(DATA / "mosaics" / args.aoi, args.months)
     grid = read_grid(paths[0])
@@ -67,7 +69,6 @@ def main() -> None:
                     bands=s2_bands(grid.band_names),
                     crs=f"EPSG:{grid.epsg}",
                     transform=grid.transform,
-                    encoding=encoding,
                     codec=codec,
                     level=level,
                     workers=args.workers,

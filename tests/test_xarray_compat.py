@@ -16,7 +16,7 @@ pytestmark = pytest.mark.unit
 def store_and_truth(request, tmp_path_factory):
     truth = make_truth(3, 2, 700, 600)
     path = tmp_path_factory.mktemp("xr") / "store"
-    build_store(path, truth, shard=request.param, anchor_interval=2)
+    build_store(path, truth, shard=request.param)
     return path, truth
 
 
@@ -62,15 +62,10 @@ def test_coordinates_and_pyramid_levels(store_and_truth):
         assert float(ds["y"][0]) == 2540440.0 - pixel / 2
 
 
-def test_anchors_are_true_values_and_deltas_are_residuals(store_and_truth):
+def test_all_timesteps_are_true_values(store_and_truth):
     path, truth = store_and_truth
-    data = _open(path, consolidated=False)["data"]
-    for anchor in (0, 2):
-        assert np.array_equal(data.isel(time=anchor).values, truth[anchor])
-    raw_delta = data.isel(time=1).values
-    residual = raw_delta.view(np.int16).astype(np.int32)
-    assert np.array_equal(residual, truth[1].astype(np.int32) - truth[0].astype(np.int32))
-    assert not np.array_equal(raw_delta, truth[1])
+    data = xr.open_zarr(path, group="0", chunks=None, mask_and_scale=False)["data"]
+    assert np.array_equal(data.values, truth)
 
 
 def test_level_attrs_visible_to_plain_readers(store_and_truth):

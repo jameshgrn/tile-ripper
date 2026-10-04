@@ -1,5 +1,7 @@
 # Bring your own raster time series
 
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
+
 Convert your observations, read their numeric values in Python, and publish a viewer and an
 embed example alongside the data. The output is an independent static directory: no requests
 to chronozarr.org or its demo stores are needed to view it. JavaScript dependencies, including
@@ -25,9 +27,10 @@ recipe with Python 3.13, a fresh environment and newly downloaded observations.
 The Python converter and reader are also available as `chronozarr[geo]` on PyPI. The bundle
 script currently needs this checkout because it copies the complete viewer and vendored
 JavaScript dependencies. It does not need an npm install or a JavaScript build.
-The next-release npm package also includes a standalone viewer copy command; see
-[self-host the packaged viewer](../../docs/viewer-distribution.md) for the locally packed,
-checkout-independent workflow. These package changes have not been released to npm.
+The v0.3 npm package prepared in this checkout, `chronozarr` 0.3.0, contains the reader and MapLibre layer.
+The standalone viewer copy command is available only from a locally packed checkout
+build; see [self-host the packaged viewer](../../docs/viewer-distribution.md) for that
+checkout-independent workflow.
 
 ## Optional: start with independently downloaded real observations
 
@@ -38,7 +41,7 @@ If you do not have a raster series ready, fetch three Sentinel-2 acquisitions ne
 uv sync --extra geo --extra ingest
 uv run python examples/bring_your_data/fetch_sample.py /tmp/lake-mead-input
 uv run chronozarr convert /tmp/lake-mead-input/observations.csv /tmp/lake-mead-series
-uv run chronozarr convert /tmp/lake-mead-input/observations.csv /tmp/lake-mead-plain --encoding none
+uv run chronozarr convert /tmp/lake-mead-input/observations.csv /tmp/lake-mead-plain
 uv run python examples/bring_your_data/verify.py /tmp/lake-mead-input/observations.csv \
   /tmp/lake-mead-series /tmp/lake-mead-plain /tmp/lake-mead-verification.json
 uv run python examples/bring_your_data/compare_local.py /tmp/lake-mead-input/observations.csv \

@@ -1,9 +1,9 @@
 """chronozarr schema: attribute dataclasses, layout helpers, and store validation.
 
 The layout is documented in spec/CHRONOZARR.md and spec/CHANGES-0.2.md. This module owns
-everything both the writer and the reader must agree on: attribute names, the anchor schedule,
+everything both the writer and the reader must agree on: attribute names,
 pyramid geometry, dtype profiles, and the checks that decide whether a Zarr v3 store is a
-conforming chronozarr store. New stores are v0.2; v0.1 stores stay readable.
+conforming chronozarr store. Only v0.3.0 is accepted; older stores need explicit conversion.
 """
 
 from __future__ import annotations
@@ -22,12 +22,9 @@ import zarr
 from zarr.core.sync import sync
 from zarr.errors import GroupNotFoundError
 
-from chronozarr.store import as_store
+from chronozarr.store import IndexStore, as_store, check_extensions
 
-SPEC_VERSION = "0.2.0"
-STAR_DELTA = "star-delta"
-NONE = "none"
-ENCODINGS = (NONE, STAR_DELTA)
+SPEC_VERSION = "0.3.0"
 VARIABLE = "data"
 MASK_VARIABLE = "mask"
 COVERAGE_VARIABLE = "coverage"
@@ -36,15 +33,12 @@ NODATA = 0
 DIMENSIONS = ("time", "band", "y", "x")
 PLANE_DIMENSIONS = ("time", "y", "x")  # the mask and coverage variables
 DTYPES = ("uint8", "uint16", "int16", "float32")
-TEMPORAL_DTYPES = ("uint8", "uint16")  # star-delta residuals need modular unsigned arithmetic
 GAP_FILLS = ("carry-forward", "none")
 CODECS = ("zstd", "gzip", "blosc")
 TIME_UNITS = "milliseconds since 1970-01-01T00:00:00"
 TIME_CALENDAR = "proleptic_gregorian"
 
 Transform = tuple[float, float, float, float, float, float]
-
-_VERSION_RE = re.compile(r"^0\.[12]\.\d+$")
 
 
 class SchemaError(ValueError):
@@ -54,52 +48,14 @@ class SchemaError(ValueError):
 # --- Layout helpers -------------------------------------------------------------------------
 
 
-def compute_anchor_schedule(n_time: int, anchor_interval: int) -> tuple[list[int], dict[int, int]]:
-    """Return (anchor_indices, delta_reference) as a fresh encode writes them.
-
-    Anchors are 0, k, 2k, ... below n_time. Every other timestep references the nearest anchor
-    by index distance; ties go to the earlier anchor. Decoding any timestep needs one anchor
-    and one delta. The anchors depend only on a timestep's position; the references are the
-    writer's default for new timesteps, not a validity rule (`delta_reference_problem`): an
-    append keeps the references already recorded.
-    """
-    anchors = list(range(0, n_time, anchor_interval))
-    reference: dict[int, int] = {}
-    for t in range(n_time):
-        if t % anchor_interval == 0:
-            continue
-        earlier = t - t % anchor_interval
-        later = earlier + anchor_interval
-        reference[t] = later if later < n_time and later - t < t - earlier else earlier
-    return anchors, reference
-
-
-def delta_reference_problem(
-    reference: Mapping[int, int], anchors: Sequence[int], n_time: int, interval: int
-) -> str | None:
-    """Why `reference` is not a valid star-delta reference map, or None when it is valid.
-
-    Valid means: every non-anchor timestep is a key, no anchor is, and each value is an anchor
-    at index distance 0 < d < `interval` from its key. Nothing requires the nearest anchor.
-    """
-    anchor_set = set(anchors)
-    non_anchors = set(range(n_time)) - anchor_set
-    missing = sorted(non_anchors - reference.keys())
-    if missing:
-        return f"timesteps {missing[:5]} are neither anchors nor listed"
-    unexpected = sorted(reference.keys() - non_anchors)
-    if unexpected:
-        return f"keys {unexpected[:5]} are anchors or outside 0..{n_time - 1}"
-    for t in sorted(reference):
-        anchor = reference[t]
-        if anchor not in anchor_set:
-            return f"timestep {t} references {anchor}, which is not an anchor"
-        if abs(anchor - t) >= interval:
-            return (
-                f"timestep {t} references anchor {anchor} at distance {abs(anchor - t)}; "
-                f"the distance must be below anchor_interval {interval}"
-            )
-    return None
+def comparison_schedule(n_time: int, interval: int = 6) -> dict[int, int]:
+    """Nominal volatility comparisons; independent of storage and decoding."""
+    comparisons = list(range(0, n_time, interval))
+    return {
+        t: min(comparisons, key=lambda q: (abs(q - t), q))
+        for t in range(n_time)
+        if t not in comparisons
+    }
 
 
 def scale_transform(transform: Transform, level: int) -> Transform:
@@ -192,51 +148,6 @@ class Band:
 
 
 @dataclass(frozen=True)
-class Selection:
-    """The auto encoding measurement: star-delta bytes over plain bytes on sampled cells."""
-
-    sampled_cells: int
-    ratio: float
-    mode: str = "auto"
-
-    def to_attrs(self) -> dict[str, Any]:
-        return {"mode": self.mode, "sampled_cells": self.sampled_cells, "ratio": self.ratio}
-
-
-@dataclass(frozen=True)
-class Temporal:
-    """Temporal encoding. `none` is represented as a schedule where every timestep is an anchor
-    (anchor_interval 1, no deltas), so readers share one code path."""
-
-    anchor_interval: int
-    anchor_indices: tuple[int, ...]
-    delta_reference: Mapping[int, int]
-    encoding: str = STAR_DELTA
-    selection: Selection | None = None
-
-    @classmethod
-    def build(
-        cls, n_time: int, anchor_interval: int, selection: Selection | None = None
-    ) -> Temporal:
-        anchors, reference = compute_anchor_schedule(n_time, anchor_interval)
-        return cls(anchor_interval, tuple(anchors), reference, STAR_DELTA, selection)
-
-    @classmethod
-    def plain(cls, n_time: int, selection: Selection | None = None) -> Temporal:
-        return cls(1, tuple(range(n_time)), {}, NONE, selection)
-
-    def to_attrs(self) -> dict[str, Any]:
-        attrs: dict[str, Any] = {"encoding": self.encoding}
-        if self.encoding == STAR_DELTA:
-            attrs["anchor_interval"] = self.anchor_interval
-            attrs["anchor_indices"] = list(self.anchor_indices)
-            attrs["delta_reference"] = {str(t): a for t, a in self.delta_reference.items()}
-        if self.selection is not None:
-            attrs["selection"] = self.selection.to_attrs()
-        return attrs
-
-
-@dataclass(frozen=True)
 class LevelSummary:
     """One entry of `chronozarr.levels`, mirroring the level attributes and array shape."""
 
@@ -263,11 +174,10 @@ class Chronozarr:
     times: tuple[str, ...]
     bands: tuple[Band, ...]
     crs: str
-    temporal: Temporal
     spec_version: str = SPEC_VERSION
     variable: str = VARIABLE
     nodata: int | float | None = NODATA
-    volatility_path: str = VOLATILITY_PATH
+    volatility_path: str | None = None
     mask_variable: str | None = None
     coverage_variable: str | None = None
     provenance: Mapping[str, Any] | None = None
@@ -287,9 +197,9 @@ class Chronozarr:
             "band_names": list(self.band_names),
             "nodata": self.nodata,
             "crs": self.crs,
-            "temporal": self.temporal.to_attrs(),
-            "volatility_path": self.volatility_path,
         }
+        if self.volatility_path is not None:
+            attrs["volatility_path"] = self.volatility_path
         if self.mask_variable is not None:
             attrs["mask_variable"] = self.mask_variable
         if self.coverage_variable is not None:
@@ -305,7 +215,7 @@ class Chronozarr:
 
 @dataclass(frozen=True)
 class LevelRef:
-    """One entry of `multiscales[0].datasets`.
+    """One ordered multiscales layout asset.
 
     Writers emit only `path` and `crs`. A `pixels_per_tile` key left by an earlier writer is
     ignored (spec 3.4): zarr-layer reads its presence as "global Web Mercator pyramid", and the
@@ -322,20 +232,54 @@ class RootAttrs:
     datasets: tuple[LevelRef, ...]
 
     def to_attrs(self) -> dict[str, Any]:
+        layout = [
+            {"asset": d.path}
+            if i == 0
+            else {
+                "asset": d.path,
+                "derived_from": self.datasets[i - 1].path,
+                "transform": {"scale": [2, 2], "translation": [0, 0]},
+            }
+            for i, d in enumerate(self.datasets)
+        ]
         return {
-            "multiscales": [
-                {
-                    "datasets": [{"path": d.path, "crs": d.crs} for d in self.datasets],
-                    "type": "reduce",
-                    "metadata": {
-                        "method": "block_mean",
-                        "version": f"chronozarr {SPEC_VERSION}",
-                        "args": [],
-                    },
-                }
+            "zarr_conventions": [
+                {"name": "chronozarr", "spec_url": PROFILE_URL},
+                registration("multiscales"),
             ],
+            "multiscales": {"layout": layout, "resampling_method": "average"},
             "chronozarr": self.chronozarr.to_attrs(),
         }
+
+
+PROFILE_URL = "https://github.com/chronozarr/chronozarr/blob/main/spec/CHRONOZARR.md"
+CONVENTIONS = {
+    "multiscales": "d35379db-88df-4056-af3a-620245f8e347",
+    "proj": "f17cb550-5864-4468-aeb7-f3180cfb622f",
+    "spatial": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
+}
+
+
+def registration(name: str) -> dict[str, str]:
+    return {
+        "name": name,
+        "uuid": CONVENTIONS[name],
+        "schema_url": f"https://raw.githubusercontent.com/zarr-conventions/{name}/refs/tags/v0.1/schema.json",
+        "spec_url": f"https://github.com/zarr-conventions/{name}/blob/v0.1/README.md",
+    }
+
+
+def check_registrations(attrs: Mapping[str, Any], names: Sequence[str], where: str) -> None:
+    registrations = attrs.get("zarr_conventions")
+    if not isinstance(registrations, list):
+        raise _fail(where, "missing zarr_conventions registrations")
+    for name in names:
+        expected = (
+            registration(name) if name != "chronozarr" else {"name": name, "spec_url": PROFILE_URL}
+        )
+        matches = [r for r in registrations if isinstance(r, dict) and r.get("name") == name]
+        if len(matches) != 1 or any(matches[0].get(k) != v for k, v in expected.items()):
+            raise _fail(where, f"invalid {name} registration; expected {expected}")
 
 
 @dataclass(frozen=True)
@@ -393,11 +337,16 @@ def data_array_attrs(
         "crs": crs,
         "transform": list(transform),
         "proj:code": crs,
+        "zarr_conventions": [registration("proj"), registration("spatial")],
+        "spatial:registration": "pixel",
+        "spatial:transform_type": "affine",
         "spatial:dimensions": ["y", "x"],
         "spatial:shape": [height, width],
         "spatial:transform": list(transform),
         "spatial:bbox": list(bounds(transform, height, width)),
     }
+    if nodata is None:
+        attrs.pop("nodata")
     gdal_crs = crs_attr(crs)
     if gdal_crs is not None:
         attrs["_CRS"] = dict(gdal_crs)
@@ -483,56 +432,6 @@ def parse_bands(value: Any, where: str) -> tuple[Band, ...]:
     if len(set(names)) != len(names):
         raise _fail(where, f"band names must be unique, got {names}")
     return bands
-
-
-def _parse_selection(raw: Any, where: str) -> Selection:
-    mode = _require(raw, "mode", where)
-    if mode != "auto":
-        raise _fail(f"{where}.mode", f"expected 'auto', got {mode!r}")
-    sampled = _require(raw, "sampled_cells", where)
-    if not _is_int(sampled) or sampled < 0:
-        raise _fail(f"{where}.sampled_cells", f"expected int >= 0, got {sampled!r}")
-    ratio = _require(raw, "ratio", where)
-    if not _is_number(ratio) or ratio < 0:
-        raise _fail(f"{where}.ratio", f"expected a number >= 0, got {ratio!r}")
-    return Selection(int(sampled), float(ratio), mode)
-
-
-def _parse_temporal(block: Any, n_time: int, where: str) -> Temporal:
-    encoding = _require(block, "encoding", where)
-    if encoding not in ENCODINGS:
-        raise _fail(f"{where}.encoding", f"expected one of {list(ENCODINGS)}, got {encoding!r}")
-    selection = (
-        _parse_selection(block["selection"], f"{where}.selection")
-        if "selection" in block
-        else None
-    )
-    if encoding == NONE:
-        return Temporal.plain(n_time, selection)
-    interval = _require(block, "anchor_interval", where)
-    if not _is_int(interval) or interval < 1:
-        raise _fail(f"{where}.anchor_interval", f"expected int >= 1, got {interval!r}")
-    raw_anchors = _require(block, "anchor_indices", where)
-    raw_reference = _require(block, "delta_reference", where)
-    if not isinstance(raw_anchors, list) or not all(_is_int(a) for a in raw_anchors):
-        raise _fail(f"{where}.anchor_indices", "expected a list of ints")
-    if not isinstance(raw_reference, Mapping):
-        raise _fail(f"{where}.delta_reference", "expected an object keyed by timestep index")
-    try:
-        reference = {int(t): a for t, a in raw_reference.items()}
-    except ValueError as exc:
-        raise _fail(f"{where}.delta_reference", "keys must be decimal timestep indices") from exc
-
-    anchors, _ = compute_anchor_schedule(n_time, interval)
-    if raw_anchors != anchors:
-        raise _fail(
-            f"{where}.anchor_indices",
-            f"expected {anchors} for n_time={n_time}, anchor_interval={interval}; "
-            f"got {raw_anchors}",
-        )
-    if (problem := delta_reference_problem(reference, anchors, n_time, interval)) is not None:
-        raise _fail(f"{where}.delta_reference", problem)
-    return Temporal(interval, tuple(raw_anchors), reference, STAR_DELTA, selection)
 
 
 def parse_provenance(raw: Any, where: str = "chronozarr.provenance") -> dict[str, Any]:
@@ -634,11 +533,15 @@ def _parse_nodata(value: Any, where: str) -> int | float | None:
 
 def parse_chronozarr(block: Any, where: str = "chronozarr") -> Chronozarr:
     """Validate and parse the `chronozarr` root attribute block (v0.1 or v0.2)."""
-    version = _require(block, "spec_version", where)
-    if not isinstance(version, str) or not _VERSION_RE.match(version):
+    version = block.get("spec_version") if isinstance(block, Mapping) else None
+    if version != SPEC_VERSION:
         raise _fail(
-            f"{where}.spec_version", f"unsupported version {version!r}; expected 0.1.x or 0.2.x"
+            f"{where}.spec_version",
+            f"unsupported or missing version {version!r}; expected {SPEC_VERSION}; "
+            "use chronozarr convert before opening with a v0.3 reader",
         )
+    if "temporal" in block:
+        raise _fail(where, "temporal encoding is outside v0.3; use chronozarr convert")
     variable = _require(block, "variable", where)
     if not isinstance(variable, str) or not variable:
         raise _fail(f"{where}.variable", f"expected a non-empty array name, got {variable!r}")
@@ -653,10 +556,19 @@ def parse_chronozarr(block: Any, where: str = "chronozarr") -> Chronozarr:
     crs = _require(block, "crs", where)
     if not isinstance(crs, str) or not crs:
         raise _fail(f"{where}.crs", "expected a non-empty string such as 'EPSG:32631'")
-    volatility_path = _require(block, "volatility_path", where)
-    if not isinstance(volatility_path, str) or not volatility_path:
-        raise _fail(f"{where}.volatility_path", "expected a non-empty string")
-    temporal = _parse_temporal(_require(block, "temporal", where), len(times), f"{where}.temporal")
+    if _EPSG_RE.fullmatch(crs) is None:
+        raise _fail(f"{where}.crs", "only EPSG CRSs are supported")
+    if not all(isinstance(b, Mapping) for b in block["bands"]):
+        raise _fail(f"{where}.bands", "v0.3 requires band objects")
+    volatility_path = _optional_str(block, "volatility_path", where)
+    if volatility_path not in (None, VOLATILITY_PATH):
+        raise _fail(where, "volatility_path must be volatility")
+    for key, expected in (
+        ("mask_variable", MASK_VARIABLE),
+        ("coverage_variable", COVERAGE_VARIABLE),
+    ):
+        if key in block and block[key] != expected:
+            raise _fail(where, f"{key} must be {expected}")
     provenance = (
         parse_provenance(block["provenance"], f"{where}.provenance")
         if block.get("provenance") is not None
@@ -666,7 +578,6 @@ def parse_chronozarr(block: Any, where: str = "chronozarr") -> Chronozarr:
         times=times,
         bands=bands,
         crs=crs,
-        temporal=temporal,
         spec_version=version,
         variable=variable,
         nodata=nodata,
@@ -685,29 +596,32 @@ def parse_chronozarr(block: Any, where: str = "chronozarr") -> Chronozarr:
 
 def _parse_multiscales(attrs: Mapping[str, Any], crs: str) -> tuple[LevelRef, ...]:
     multiscales = _require(attrs, "multiscales", "root attributes")
-    if not isinstance(multiscales, list) or len(multiscales) != 1:
-        raise _fail("multiscales", "expected a list with exactly one entry")
-    raw = _require(multiscales[0], "datasets", "multiscales[0]")
+    if not isinstance(multiscales, Mapping):
+        raise _fail("multiscales", "expected a layout object")
+    raw = _require(multiscales, "layout", "multiscales")
     if not isinstance(raw, list) or not raw:
-        raise _fail("multiscales[0].datasets", "expected a non-empty list")
+        raise _fail("multiscales.layout", "expected a non-empty list")
+    if multiscales.get("resampling_method") != "average":
+        raise _fail("multiscales", "resampling_method must be average")
     datasets = []
     for i, entry in enumerate(raw):
-        where = f"multiscales[0].datasets[{i}]"
-        path = _require(entry, "path", where)
-        if path != str(i):
+        if not isinstance(entry, Mapping) or entry.get("asset") != str(i):
+            raise _fail("multiscales.layout", "assets must be consecutive group paths 0, 1, ...")
+        if i and (
+            entry.get("derived_from") != str(i - 1)
+            or entry.get("transform") != {"scale": [2, 2], "translation": [0, 0]}
+        ):
             raise _fail(
-                where, f"levels must be listed as '0', '1', ... in order; got path {path!r}"
+                "multiscales.layout", "overview must derive from previous level at scale 2"
             )
-        entry_crs = _require(entry, "crs", where)
-        if entry_crs != crs:
-            raise _fail(f"{where}.crs", f"expected '{crs}' (chronozarr.crs), got {entry_crs!r}")
-        datasets.append(LevelRef(path, entry_crs))
+        datasets.append(LevelRef(str(i), crs))
     return tuple(datasets)
 
 
 def parse_root_attrs(attrs: Mapping[str, Any]) -> RootAttrs:
     """Validate and parse the root group attributes (`multiscales` + `chronozarr`)."""
     block = parse_chronozarr(_require(attrs, "chronozarr", "root attributes"))
+    check_registrations(attrs, ("chronozarr", "multiscales"), "root attributes")
     return RootAttrs(chronozarr=block, datasets=_parse_multiscales(attrs, block.crs))
 
 
@@ -721,6 +635,59 @@ def parse_level_attrs(attrs: Mapping[str, Any], where: str) -> LevelAttrs:
     if not _is_number(resolution) or resolution <= 0:
         raise _fail(f"{where}.resolution", f"expected a positive number, got {resolution!r}")
     return LevelAttrs(crs=crs, transform=transform, resolution=float(resolution))
+
+
+def canonical_level(data: zarr.Array, where: str) -> LevelAttrs:
+    a = data.attrs.asdict()
+    check_registrations(a, ("proj", "spatial"), where)
+    crs = _require(a, "proj:code", where)
+    if not isinstance(crs, str) or _EPSG_RE.fullmatch(crs) is None:
+        raise _fail(where, "proj:code must be EPSG:<code>")
+    transform = _parse_transform(_require(a, "spatial:transform", where), where)
+    if not all(math.isfinite(v) for v in transform) or not (
+        transform[0] > 0 and transform[4] < 0 and transform[1] == transform[3] == 0
+    ):
+        raise _fail(where, "spatial:transform must be finite and north-up")
+    if a.get("spatial:dimensions") != ["y", "x"] or a.get("spatial:registration") != "pixel":
+        raise _fail(where, "spatial dimensions must be y/x with pixel registration")
+    if a.get("spatial:transform_type", "affine") != "affine":
+        raise _fail(where, "spatial transform type must be affine")
+    return LevelAttrs(crs, transform, transform[0])
+
+
+def _check_spatial(
+    data: zarr.Array,
+    crs: str,
+    transform: Transform,
+    h: int,
+    w: int,
+    where: str,
+    problems: list[str],
+) -> None:
+    try:
+        canonical = canonical_level(data, where)
+        if canonical.crs != crs or not same_numbers(canonical.transform, transform):
+            problems.append(f"{where}: canonical geometry differs from level/root mirrors")
+    except SchemaError as exc:
+        problems.append(str(exc))
+    attrs = data.attrs.asdict()
+    for key, expected in (
+        ("crs", crs),
+        ("transform", list(transform)),
+        ("spatial:shape", [h, w]),
+        ("proj:shape", [h, w]),
+        ("spatial:bbox", list(bounds(transform, h, w))),
+        ("proj:bbox", list(bounds(transform, h, w))),
+    ):
+        if key in attrs and attrs[key] != expected:
+            problems.append(f"{where}: {key} differs from geometry")
+    try:
+        check_codecs(data, where)
+    except SchemaError as exc:
+        problems.append(str(exc))
+    if "scale_factor" in attrs or "add_offset" in attrs:
+        problems.append(f"{where}: CF automatic scaling is forbidden")
+    _check_crs_attr(attrs, crs, where, problems)
 
 
 def get_group(parent: zarr.Group, name: str, where: str) -> zarr.Group:
@@ -793,6 +760,34 @@ def _codec_names(array: zarr.Array) -> list[str]:
     return [str(c.get("name")) for c in codecs]
 
 
+def check_codecs(array: zarr.Array, where: str) -> None:
+    codecs = cast("list[dict[str, Any]]", array.metadata.to_dict()["codecs"])
+    if len(codecs) == 1 and codecs[0]["name"] == "sharding_indexed":
+        codecs = codecs[0]["configuration"]["codecs"]
+    string = array.dtype.kind in "OTU"
+    serializer = "vlen-utf8" if string else "bytes"
+    if len(codecs) != 2 or codecs[0]["name"] != serializer or codecs[1]["name"] not in CODECS:
+        raise _fail(where, f"unsupported codec chain {[c['name'] for c in codecs]}")
+    if (
+        not string
+        and array.dtype.itemsize > 1
+        and codecs[0].get("configuration", {}).get("endian") != "little"
+    ):
+        raise _fail(where, "bytes codec must be little endian")
+    codec = codecs[1]
+    config = codec.get("configuration", {})
+    if codec["name"] == "blosc" and (
+        config.get("cname") not in ("zstd", "lz4")
+        or config.get("shuffle") not in ("shuffle", "noshuffle")
+        or not 0 <= config.get("clevel", -1) <= 9
+        or config.get("typesize") != array.dtype.itemsize
+        or config.get("blocksize") != 0
+    ):
+        raise _fail(where, "unsupported blosc configuration")
+    if codec["name"] == "gzip" and not 1 <= config.get("level", 0) <= 9:
+        raise _fail(where, "gzip level must be 1..9")
+
+
 @dataclass
 class _LevelState:
     """What later levels compare against: level 0 values and the time shard length."""
@@ -802,6 +797,7 @@ class _LevelState:
     cs: int | None = None
     shard_time: int | None = None
     sharded: bool | None = None
+    dtype: str | None = None
 
 
 def _check_crs_attr(attrs: Mapping[str, Any], crs: str, where: str, problems: list[str]) -> None:
@@ -829,6 +825,14 @@ def _check_layout(
     problems: list[str],
 ) -> None:
     """Chunks (1, *lead, cs, cs) and, if sharded, shards (shard_time, *lead, cs, cs)."""
+    metadata = array.metadata.to_dict()
+    if metadata.get("chunk_grid", {}).get("name") != "regular":
+        problems.append(f"{name}: grid must be regular")
+    if metadata.get("chunk_key_encoding") != {
+        "name": "default",
+        "configuration": {"separator": "/"},
+    }:
+        problems.append(f"{name}: chunk keys must use default slash encoding")
     chunks = (1, *lead, cs, cs)
     if tuple(array.chunks) != chunks:
         problems.append(f"{name}: chunks must be {chunks}, got {tuple(array.chunks)}")
@@ -894,14 +898,16 @@ def _check_data_array(
     _check_dims(data, DIMENSIONS, where, problems)
     if data.dtype.name not in DTYPES:
         problems.append(f"{where}: dtype must be one of {list(DTYPES)}, got {data.dtype}")
-    if meta.temporal.encoding == STAR_DELTA and data.dtype.name not in TEMPORAL_DTYPES:
-        problems.append(
-            f"{where}: star-delta needs one of {list(TEMPORAL_DTYPES)}, got {data.dtype}"
-        )
     if data.ndim != 4:
         problems.append(f"{where}: expected 4 dimensions (time, band, y, x), got {data.ndim}")
         return None
+    if state.dtype is None:
+        state.dtype = data.dtype.name
+    elif data.dtype.name != state.dtype:
+        problems.append(f"{where}: dtype differs from level 0")
     n_time, n_band, height, width = data.shape
+    if min(data.shape) <= 0:
+        problems.append(f"{where}: axis lengths must be positive")
     if n_time != len(meta.times):
         problems.append(f"{where}: {n_time} timesteps but chronozarr.times has {len(meta.times)}")
     if n_band != len(meta.bands):
@@ -915,10 +921,21 @@ def _check_data_array(
         state.shard_time = data.shards[0] if data.shards is not None else None
     if state.cs is None:
         state.cs = int(data.chunks[2])  # the cell size is the chunk size of the first level read
+    if state.cs < 2 or state.cs % 2:
+        problems.append(f"{where}: cell size must be positive and even")
     _check_layout(data, where, (n_band,), state.cs, state, problems)
     names = _codec_names(data)
     if len(names) != 2 or names[0] != "bytes" or names[1] not in CODECS:
         problems.append(f"{where}: codecs must be bytes plus one of {list(CODECS)}, got {names}")
+    if meta.nodata is not None:
+        if data.dtype.kind in "ui":
+            limits = np.iinfo(data.dtype)
+            if int(meta.nodata) != meta.nodata or not limits.min <= meta.nodata <= limits.max:
+                problems.append(f"{where}: nodata is not representable in dtype")
+        elif (
+            not np.isfinite(np.float64(meta.nodata)) or abs(meta.nodata) > np.finfo(np.float32).max
+        ):
+            problems.append(f"{where}: nodata is not representable in float32")
     fill = meta.nodata if meta.nodata is not None else 0
     if data.fill_value != fill:
         problems.append(f"{where}: fill_value must equal nodata ({fill}), got {data.fill_value}")
@@ -942,6 +959,12 @@ def _check_level(
         problems.append(str(exc))
         return
 
+    for name, declaration in (
+        (MASK_VARIABLE, meta.mask_variable),
+        (COVERAGE_VARIABLE, meta.coverage_variable),
+    ):
+        if name in group and declaration is None:
+            problems.append(f"{prefix}/{name}: array present without root declaration")
     if attrs.crs != meta.crs:
         problems.append(f"{prefix}: crs {attrs.crs!r} differs from chronozarr.crs {meta.crs!r}")
     if state.attrs is not None and not same_numbers(
@@ -989,32 +1012,63 @@ def _check_level(
             )
 
     a = data.attrs.asdict()
-    if "nodata" not in a or a["nodata"] != meta.nodata:
+    if (meta.nodata is None and "nodata" in a) or (
+        meta.nodata is not None and a.get("nodata") != meta.nodata
+    ):
         problems.append(
             f"{where}: attribute nodata must be {meta.nodata!r}, got {a.get('nodata')!r}"
         )
-    # proj:/spatial: (and the duplicated crs/transform) are optional: readers must not require
-    # them, so they are checked only when present.
-    optional_values = {
-        "crs": meta.crs,
-        "proj:code": meta.crs,
-        "spatial:dimensions": ["y", "x"],
-        "spatial:shape": [height, width],
-    }
-    for key, value in optional_values.items():
-        if key in a and a[key] != value:
-            problems.append(f"{where}: attribute {key} must be {value!r}, got {a[key]!r}")
-    optional_numbers = {
-        "transform": list(attrs.transform),
-        "spatial:transform": list(attrs.transform),
-        "spatial:bbox": list(bounds(attrs.transform, height, width)),
-    }
-    for key, value in optional_numbers.items():
-        got = a.get(key)
-        if key in a and not (isinstance(got, list) and same_numbers(got, value)):
-            problems.append(f"{where}: attribute {key} must be {value}, got {got}")
-    _check_crs_attr(a, meta.crs, where, problems)
-
+    for variable in (meta.variable, meta.mask_variable, meta.coverage_variable):
+        if variable is not None and variable in group:
+            _check_spatial(
+                get_array(group, variable, prefix),
+                meta.crs,
+                attrs.transform,
+                height,
+                width,
+                f"{prefix}/{variable}",
+                problems,
+            )
+    if attrs.resolution != attrs.transform[0]:
+        problems.append(f"{prefix}: resolution differs from spatial transform")
+    for name in ("time", "band", "x", "y"):
+        if name not in members:
+            continue
+        coordinate = members[name]
+        if name == "time" and (
+            coordinate.dtype != np.dtype("int64")
+            or coordinate.attrs.get("units") != TIME_UNITS
+            or coordinate.attrs.get("calendar") != TIME_CALENDAR
+        ):
+            problems.append(f"{prefix}/time: requires int64 CF epoch-ms units and calendar")
+        if name in ("x", "y") and coordinate.dtype != np.dtype("float64"):
+            problems.append(f"{prefix}/{name}: dtype must be float64")
+        if (
+            name == "band"
+            and coordinate.dtype != np.dtype("int32")
+            and coordinate.dtype.kind not in "OTU"
+        ):
+            problems.append(f"{prefix}/band: dtype must be int32 or string")
+        if any(
+            isinstance(r, dict) and r.get("name") == "spatial"
+            for r in coordinate.attrs.get("zarr_conventions", [])
+        ):
+            problems.append(f"{prefix}/{name}: coordinates must not register spatial")
+        try:
+            check_codecs(coordinate, f"{prefix}/{name}")
+        except SchemaError as exc:
+            problems.append(str(exc))
+    for variable in (meta.mask_variable, meta.coverage_variable):
+        if variable is not None and variable in group:
+            plane = get_array(group, variable, prefix)
+            if _compression_config(plane) != _compression_config(data):
+                problems.append(f"{prefix}/{variable}: compression differs from data")
+            if variable == meta.mask_variable:
+                for t in range(plane.shape[0]):
+                    values = np.asarray(plane[t])
+                    if not np.isin(values, [0, 1]).all():
+                        problems.append(f"{prefix}/{variable}: mask must contain only 0 and 1")
+                        break
     if "time" in members:
         stored = np.asarray(members["time"][:])
         expected_ms = np.array([parse_time(t) for t in meta.times], dtype="datetime64[ms]")
@@ -1022,7 +1076,11 @@ def _check_level(
             stored.astype("datetime64[ms]"), expected_ms
         ):
             problems.append(f"{prefix}/time: values differ from chronozarr.times")
-    if "band" in members and np.asarray(members["band"][:]).tolist() != list(meta.band_names):
+    if "band" in members and np.asarray(members["band"][:]).tolist() != (
+        list(range(len(meta.bands)))
+        if members["band"].dtype == np.dtype("int32")
+        else list(meta.band_names)
+    ):
         problems.append(f"{prefix}/band: values differ from chronozarr.bands")
     if "x" in members and "y" in members:
         y, x = pixel_centers(attrs.transform, height, width)
@@ -1119,34 +1177,74 @@ def validate(store: Any) -> list[str]:
 
     `store` is anything `zarr.open_group` accepts: a path, URL, or zarr Store. Per-node
     `zarr.json` files are checked directly; consolidated metadata, when present, must match them.
-    Both v0.1 and v0.2 stores are accepted.
+    Only the exact v0.3.0 profile is accepted.
     """
     store = as_store(store)
+    from pathlib import Path
+
+    from zarr.storage import LocalStore
+
+    if isinstance(store, str | Path):
+        store = LocalStore(store, read_only=True)
+    store = IndexStore(store)
     problems: list[str] = []
     try:
         root = zarr.open_group(store, mode="r", zarr_format=3, use_consolidated=False)
     except (GroupNotFoundError, FileNotFoundError):
         return [f"{store}: no Zarr v3 group found (is this a chronozarr store?)"]
+    except ValueError as exc:
+        return [str(exc)]
     try:
+        import json
+
+        from zarr.core.buffer import default_buffer_prototype
+
+        manifest = sync(root.store.get("zarr.json", default_buffer_prototype()))
+        if manifest is not None:
+            check_extensions(json.loads(manifest.to_bytes()))
         attrs = parse_root_attrs(root.attrs.asdict())
-    except SchemaError as exc:
+    except ValueError as exc:
         return [str(exc)]
 
+    raw_meta = cast("dict[str, Any]", root.attrs.asdict()["chronozarr"])
+    for key in ("band_names", "levels"):
+        if key not in raw_meta:
+            problems.append(
+                f"chronozarr: writer must emit {key}; reader fallback remains available"
+            )
     state = _LevelState()
     for index, dataset in enumerate(attrs.datasets):
-        _check_level(root, index, dataset, attrs.chronozarr, state, problems)
+        try:
+            _check_level(root, index, dataset, attrs.chronozarr, state, problems)
+        except (ValueError, KeyError, TypeError) as exc:
+            problems.append(f"level {dataset.path}: {exc}")
 
     _check_levels_attr(root, attrs, problems)
     _check_shard_bytes(root, attrs, problems)
     problems.extend(_check_consolidated(store, root))
 
     path = attrs.chronozarr.volatility_path
+    if path is None:
+        if VOLATILITY_PATH in root:
+            problems.append("volatility: array present without declaration")
+        return problems
     try:
         volatility = get_array(root, path, "store")
     except SchemaError as exc:
         problems.append(str(exc))
     else:
         _check_dims(volatility, ("row", "col"), path, problems)
+        if tuple(volatility.chunks) != tuple(volatility.shape):
+            problems.append(f"{path}: must occupy a single chunk")
+        if "spatial:dimensions" in volatility.attrs:
+            problems.append(f"{path}: must not be georeferenced")
+        try:
+            check_codecs(volatility, path)
+        except SchemaError as exc:
+            problems.append(str(exc))
+        values = np.asarray(volatility[:])
+        if not (np.isfinite(values).all() and (values >= 0).all() and (values <= 1).all()):
+            problems.append(f"{path}: values must be finite in [0,1]")
         if volatility.dtype != np.dtype("float32"):
             problems.append(f"{path}: dtype must be float32, got {volatility.dtype}")
         if state.shape is not None and state.cs is not None:
@@ -1157,3 +1255,15 @@ def validate(store: Any) -> list[str]:
                     f"{expected_grid}"
                 )
     return problems
+
+
+def _compression_config(array: zarr.Array) -> dict[str, Any]:
+    codecs = cast("list[dict[str, Any]]", array.metadata.to_dict()["codecs"])
+    if codecs[0]["name"] == "sharding_indexed":
+        codecs = codecs[0]["configuration"]["codecs"]
+    configuration = dict(codecs[-1])
+    if configuration["name"] == "blosc":
+        configuration["configuration"] = {
+            k: v for k, v in configuration["configuration"].items() if k != "typesize"
+        }
+    return configuration

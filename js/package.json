@@ -1,7 +1,7 @@
 {
   "name": "chronozarr",
-  "version": "0.2.1",
-  "description": "Browser and Node reader for chronozarr stores (spec 0.1 and 0.2), plus a MapLibre GL JS custom layer",
+  "version": "0.3.0",
+  "description": "Browser and Node reader for chronozarr v0.3 true-value stores, plus a MapLibre GL JS custom layer",
   "keywords": [
     "chronozarr",
     "zarr",

@@ -5,17 +5,14 @@ import { PRODUCT_GLSL } from '../shared/products-glsl.js';
 
 const DTYPES = { uint8: { sampler: 'usampler2DArray', modulus: '255u' }, uint16: { sampler: 'usampler2DArray', modulus: '65535u' }, int16: { sampler: 'isampler2DArray', modulus: null }, float32: { sampler: 'sampler2DArray', modulus: null } };
 
-test('the fragment shader is built per dtype: sampler, modular reconstruction only for unsigned star-delta types', () => {
+test('the fragment shader is built per dtype: sampler and direct true-value reads', () => {
   for (const [dtype, { sampler, modulus }] of Object.entries(DTYPES)) {
     const source = fragmentShader({ dtype, hasMask: false });
     assert.ok(source.startsWith('#version 300 es\n'), dtype);
     assert.ok(!source.includes('${') && !source.includes('undefined'), `${dtype}: unexpanded template text`);
     assert.ok(source.includes(`uniform ${sampler} u_data;`), `${dtype}: sampler`);
-    if (modulus === null) {
-      assert.ok(!source.includes('u_deltaBase + band'), `${dtype} has no residual chunks`);
-    } else {
-      assert.ok(source.includes(`(a + d) & ${modulus}`), `${dtype}: modular reconstruction`);
-    }
+    assert.ok(source.includes('u_dataBase + band'));
+    assert.doesNotMatch(source, /u_deltaBase|u_anchorBase|a \+ d/);
     assert.equal(source.includes('isnan(v)'), dtype === 'float32', `${dtype}: NaN counts as no data only for floats`);
   }
 });

@@ -95,14 +95,14 @@ def serving(handler: type[StoreRequestHandler], root: Path) -> Iterator[str]:
 @pytest.fixture(scope="module")
 def sharded_store(tmp_path_factory) -> Path:
     path = tmp_path_factory.mktemp("doctor") / "sharded"
-    build_store(path, make_truth(5, 2, 40, 50), shard=True, chunk_size=16, anchor_interval=2)
+    build_store(path, make_truth(5, 2, 40, 50), shard=True, chunk_size=16)
     return path
 
 
 @pytest.fixture(scope="module")
 def unsharded_store(tmp_path_factory) -> Path:
     path = tmp_path_factory.mktemp("doctor") / "unsharded"
-    build_store(path, make_truth(5, 2, 40, 50), shard=False, chunk_size=16, anchor_interval=2)
+    build_store(path, make_truth(5, 2, 40, 50), shard=False, chunk_size=16)
     return path
 
 
@@ -155,25 +155,15 @@ def test_http_store_passes_browser_checks(sharded_store):
     assert checks["decode level 0"].status == "ok"
 
 
-def test_pixels_per_tile_is_mentioned_only_when_the_store_still_carries_it(
-    sharded_store, tmp_path
-):
-    with serving(StoreRequestHandler, sharded_store) as url:
-        current = diagnose(url)
-    assert "pixels_per_tile" not in by_name(current)
-
+def test_doctor_reports_version_rejection_with_conversion_guidance(sharded_store, tmp_path):
     old = tmp_path / "old"
     shutil.copytree(sharded_store, old)
     document = json.loads((old / "zarr.json").read_text())
-    for dataset in document["attributes"]["multiscales"][0]["datasets"]:
-        dataset["pixels_per_tile"] = 16
+    document["attributes"]["chronozarr"]["spec_version"] = "0.2.0"
     (old / "zarr.json").write_text(json.dumps(document))
     with serving(StoreRequestHandler, old) as url:
         checks = diagnose(url)
-    assert not failures(checks), failures(checks)
-    (line,) = [c for c in checks if c.name == "pixels_per_tile"]
-    assert line.status == "info"
-    assert "crs and bounds" in line.detail
+    assert any("chronozarr convert" in c.detail for c in failures(checks))
 
 
 def test_missing_content_range_exposure_fails(sharded_store):
@@ -185,7 +175,7 @@ def test_missing_content_range_exposure_fails(sharded_store):
 
 def test_cache_observations_are_never_failures(tmp_path):
     versioned = tmp_path / "chronozarr-2"
-    build_store(versioned, make_truth(3, 2, 20, 20), shard=True, chunk_size=16, anchor_interval=2)
+    build_store(versioned, make_truth(3, 2, 20, 20), shard=True, chunk_size=16)
     with serving(StoreRequestHandler, versioned) as url:
         advice = by_name(diagnose(url))
     assert advice["cache-control"].status == "warn"
@@ -304,7 +294,7 @@ def test_local_path_that_is_not_a_directory_fails(tmp_path):
 
 def test_corrupt_chunk_data_is_reported_per_level(tmp_path):
     path = tmp_path / "corrupt"
-    build_store(path, make_truth(5, 2, 40, 50), shard=True, chunk_size=16, anchor_interval=2)
+    build_store(path, make_truth(5, 2, 40, 50), shard=True, chunk_size=16)
     shard = sorted((path / "0" / "data" / "c").rglob("*"))
     target = next(p for p in shard if p.is_file())
     blob = bytearray(target.read_bytes())
@@ -317,7 +307,7 @@ def test_corrupt_chunk_data_is_reported_per_level(tmp_path):
 
 def test_layout_problems_fail_validate(tmp_path):
     path = tmp_path / "broken"
-    build_store(path, make_truth(3, 2, 20, 20), shard=True, chunk_size=16, anchor_interval=2)
+    build_store(path, make_truth(3, 2, 20, 20), shard=True, chunk_size=16)
     (path / "0" / "time" / "c" / "0").write_bytes(b"")
     checks = diagnose(str(path))
     assert any(c.name == "validate" and c.status == "fail" for c in checks)

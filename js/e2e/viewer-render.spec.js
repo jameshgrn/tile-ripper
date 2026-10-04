@@ -26,7 +26,7 @@ async function clickAndExpectSidebar(page, storeName, t, X, Y) {
   for (const [section, rows] of Object.entries(expected)) expect(sidebar[section], `sidebar section "${section}" at t=${t}, pixel (${X}, ${Y})`).toEqual(rows);
 }
 
-for (const storeName of ['u16_stardelta', 'u16_plain']) {
+for (const storeName of ['u16_sharded', 'u16_plain']) {
   test(`${storeName}: first paint, three scrub steps, a click, and the GPU frame equals the CPU render`, async ({ page, servers, storeUrl }) => {
     const nTime = STORES[storeName].spec.nTime;
     const timings = await openViewer(page, servers, await storeUrl(storeName));
@@ -35,14 +35,13 @@ for (const storeName of ['u16_stardelta', 'u16_plain']) {
     await expect(page.locator('#time-label')).toHaveText(isoDate(0));
     expect(await page.evaluate(() => ({ steps: window.chronozarr.viewer.store.times.length, ...window.chronozarr.viewer.store.levels[0] }))).toMatchObject({ steps: nTime, width: 200, height: 200 });
 
-    // First paint: t = 0 is an anchor.
+    // First paint: t = 0 contains true stored values.
     expect(await page.evaluate(() => window.chronozarr.viewer.paintedT)).toBe(0);
     expectFrameMatchesStore(await captureFrame(page), storeName, 0);
 
     await clickAndExpectSidebar(page, storeName, 0, 50, 40);
 
-    // Scrub three steps with the three inputs: the next button, the arrow key, a click on the timeline. With star-delta
-    // encoding t = 1 and 2 are deltas of anchor 0 and t = 3 is the next anchor.
+    // Scrub three steps with the next button, arrow key and timeline click.
     await page.locator('#next-btn').click();
     await waitForPaintedTime(page, 1);
     await expect(page.locator('#time-label')).toHaveText(isoDate(1));
@@ -65,7 +64,7 @@ for (const storeName of ['u16_stardelta', 'u16_plain']) {
 }
 
 // The four data types the texture pool holds, each with the product buttons its bands allow.
-for (const storeName of ['u8_rgb', 'u16_stardelta', 'i16_band', 'f32_band']) {
+for (const storeName of ['u8_rgb', 'u16_sharded', 'i16_band', 'f32_band']) {
   const { dtype, enabledProducts } = STORES[storeName];
   test(`${dtype} (${storeName}): renders every enabled product without errors and enables only the products its bands allow`, async ({ page, servers, storeUrl }) => {
     await openViewer(page, servers, await storeUrl(storeName));
@@ -75,7 +74,7 @@ for (const storeName of ['u8_rgb', 'u16_stardelta', 'i16_band', 'f32_band']) {
     expect(buttons.filter(([, enabled]) => enabled).map(([name]) => name), 'enabled product buttons').toEqual(enabledProducts);
     expect(buttons.filter(([, , active]) => active).map(([name]) => name), 'the first enabled product is shown').toEqual([enabledProducts[0]]);
 
-    // Every enabled product on the first frame, then one more timestep (a delta where the store has star-delta).
+    // Every enabled product on the first frame, then one more timestep (true stored values).
     for (const name of enabledProducts) {
       await page.locator('#products button', { hasText: new RegExp(`^${name}$`) }).click();
       await expect(page.locator('#products button.active')).toHaveText(name);

@@ -1,5 +1,9 @@
 # PNG frames to a store
 
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
+
+The measurements below describe historical v0.2 artifacts, not current writer options. Convert those stores before opening them with v0.3 libraries.
+
 A sequence of georeferenced PNGs, one per date, becomes a scrubbable chronozarr store with
 `chronozarr convert`. There is no GeoTIFF step. The frames are what exporters hand over: Earth Engine
 thumbnails, QGIS "Save as image" (with its world file option), matplotlib figures, drone and
@@ -143,7 +147,7 @@ Sizes and times (M3 Max laptop, other work running):
 | Raw in the store | 113.2 MB bands + 37.7 MB mask |
 | Store | 112.9 MB in 35 files: level 0 89.6 MB, level 1 23.2 MB (the masks, 0.23 MB, are inside those) |
 | `convert` | read 0.5 s, encode 1.0 s, 1.5 s in all |
-| Temporal encoding (`auto`) | `none`: star-delta / plain = 1.05 on the sampled cells, and it must be 0.85 or less |
+| Storage | True-value arrays; v0.3 does not select temporal encoding |
 
 The store is 1.5 times the size of the PNGs: level 1 is a quarter of level 0, and PNG's row filters
 compress rendered imagery better than zstd on the raw bytes (level 0 alone is 1.2 times the PNGs). What

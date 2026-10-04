@@ -19,11 +19,10 @@ const SPEC = {
   height: SIZE,
   width: SIZE,
   chunk: CHUNK,
-  anchorInterval: 4,
   sharded: false,
   nLevels: 3,
   dtype: 'uint8',
-  specVersion: '0.2.0',
+  specVersion: '0.3.0',
   encoding: 'none',
   nodata: null,
   consolidated: true,
@@ -130,7 +129,7 @@ for (const sharded of [false, true]) {
     const app = await startStaticServer(path.resolve(import.meta.dirname, '..'));
     const data = await startStaticServer(dir);
     const retryAttempts = new Map();
-    const spec = { nBand: 1, height: 40, width: 33, chunk: 32, anchorInterval: 2, sharded, shardTime: 4, specVersion: '0.2.0', shardBytes: sharded };
+    const spec = { nBand: 1, height: 40, width: 33, chunk: 32, sharded, shardTime: 4, specVersion: '0.3.0', shardBytes: sharded };
     const publish = async nTime => {
       const files = buildSyntheticStore({ ...spec, nTime }).files;
       for (const key of [...files.keys()].sort((a, b) => Number(a === '/zarr.json') - Number(b === '/zarr.json'))) {

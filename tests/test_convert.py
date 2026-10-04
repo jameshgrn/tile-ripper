@@ -28,7 +28,7 @@ rasterio = pytest.importorskip("rasterio")
 from rasterio.transform import Affine  # noqa: E402  (after importorskip)
 
 N_TIME, N_BAND, HEIGHT, WIDTH = 5, 2, 40, 50
-OPTIONS: dict[str, Any] = {"chunk_size": 16, "anchor_interval": 2}
+OPTIONS: dict[str, Any] = {"chunk_size": 16}
 DATES = ["2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01", "2024-05-01"]
 
 
@@ -175,7 +175,7 @@ def test_read_manifest_rejects_bad_manifests(tmp_path, content, suffix, message)
 def test_manifest_roundtrip_is_bit_exact(tmp_path, tifs, truth):
     manifest = write_csv(tmp_path / "m.csv", tifs, bands="B04;B08")
     out = tmp_path / "store"
-    report = convert(manifest, out, encoding="star-delta", **OPTIONS)
+    report = convert(manifest, out, **OPTIONS)
 
     assert np.array_equal(stored(out), truth)
     store = chronozarr.open_store(out)
@@ -187,7 +187,7 @@ def test_manifest_roundtrip_is_bit_exact(tmp_path, tifs, truth):
     assert chronozarr.validate(out) == []
     assert (report.n_staged, report.n_reused) == (N_TIME, 0)
     assert report.encode is not None
-    assert report.encode.encoding == "star-delta"
+    assert report.encode is not None
     assert report.total_s == report.read_s + report.encode_s
     assert not (tmp_path / "store.convert-work").exists()  # removed on success
 
@@ -221,7 +221,7 @@ def test_int16_sources_keep_dtype_and_their_own_nodata(tmp_path):
     convert(write_csv(tmp_path / "m.csv", files, DATES[:3]), out, **OPTIONS)
     store = chronozarr.open_store(out)
     assert store.attrs.nodata == -9999
-    assert store.attrs.temporal.encoding == "none"  # star-delta is uint8/uint16 only
+    assert store.attrs.spec_version == "0.3.0"
     assert np.array_equal(store.to_xarray().values, data)
     assert store.levels[0].data.dtype == np.int16
 
@@ -250,7 +250,7 @@ def test_grid_mismatch_needs_explicit_resampling_and_then_warps(tmp_path, tifs, 
     assert not (tmp_path / "refused").exists()
 
     out = tmp_path / "warped"
-    report = convert(manifest, out, resampling="nearest", encoding="none", **OPTIONS)
+    report = convert(manifest, out, resampling="nearest", **OPTIONS)
     assert report.plan.warped == 1
     result = stored(out)
     for t in (0, 1, 3, 4):
@@ -285,7 +285,6 @@ def test_explicit_transform_and_shape_crop_the_grid(tmp_path, tifs, truth):
         transform=(10.0, 0.0, left, 0.0, -10.0, top),
         shape=(20, 30),
         resampling="nearest",
-        encoding="none",
         **OPTIONS,
     )
     assert np.array_equal(stored(out), truth[:, :, 3:23, 4:34])
@@ -498,7 +497,7 @@ def test_png_frames_on_another_grid_are_warped_like_cogs(tmp_path):
     assert "frame_2.png" in str(error.value)
 
     out = tmp_path / "store"
-    report = convert(manifest, out, crs=CRS, resampling="nearest", encoding="none", **OPTIONS)
+    report = convert(manifest, out, crs=CRS, resampling="nearest", **OPTIONS)
     store = chronozarr.open_store(out)
     assert report.plan.warped == 1
     for t in (0, 1, 3):
@@ -540,7 +539,6 @@ def test_frames_located_by_bounds_can_be_cropped_onto_an_explicit_grid(tmp_path)
         transform=(10.0, 0.0, left, 0.0, -10.0, top),
         shape=(20, 24),
         resampling="nearest",
-        encoding="none",
         **OPTIONS,
     )
     store = chronozarr.open_store(out)
@@ -667,7 +665,7 @@ def test_zarr_source_with_band_dimension(tmp_path, truth):
     ds["reflectance"].attrs.update({"crs": CRS, "scale_factor": 0.0001, "units": "1"})
     ds.to_zarr(source, zarr_format=2, consolidated=True)
     out = tmp_path / "store"
-    report = convert(source, out, encoding="star-delta", **OPTIONS)
+    report = convert(source, out, **OPTIONS)
     assert np.array_equal(stored(out), truth)
     store = chronozarr.open_store(out)
     assert store.bands == ("red", "nir")
@@ -683,7 +681,7 @@ def test_zarr_source_without_band_dimension_flipped_y_and_crs_flag(tmp_path, tru
     with pytest.raises(ValueError, match="does not declare a CRS"):
         plan_conversion(source, sample=False)
     out = tmp_path / "store"
-    convert(source, out, crs=CRS, encoding="none", **OPTIONS)
+    convert(source, out, crs=CRS, **OPTIONS)
     store = chronozarr.open_store(out)
     assert store.bands == ("reflectance",)
     assert np.array_equal(store.to_xarray().values[:, 0], truth[:, 0])
@@ -696,7 +694,7 @@ def test_zarr_source_dimension_names_and_errors(tmp_path, truth):
     ds.attrs["crs"] = CRS
     ds.to_zarr(source, zarr_format=2, consolidated=True)
     out = tmp_path / "store"
-    convert(source, out, encoding="none", **OPTIONS)  # lat/lon/channel are recognised aliases
+    convert(source, out, **OPTIONS)  # lat/lon/channel are recognised aliases
     assert np.array_equal(stored(out), truth)
 
     odd = tmp_path / "odd.zarr"
@@ -723,7 +721,7 @@ def test_netcdf_source(tmp_path, truth):
     ds["reflectance"].attrs["crs"] = CRS
     ds.to_netcdf(source, engine="h5netcdf")
     out = tmp_path / "store"
-    report = convert(source, out, encoding="none", **OPTIONS)
+    report = convert(source, out, **OPTIONS)
     assert report.plan.source.kind == "NetCDF file"
     assert np.array_equal(stored(out), truth)
 
@@ -945,7 +943,7 @@ def test_int16_negative_values_keep_their_sentinel_scale_and_units(tmp_path):
     assert store.dtype == np.int16
     assert store.attrs.nodata == -9999
     assert store.attrs.mask_variable is None
-    assert store.attrs.temporal.encoding == "none"
+    assert store.attrs.spec_version == "0.3.0"
     assert band_attrs(store) == [(0.5, -10.0, "degC")] * 2
     for t in range(fx.N_TIME):
         assert np.array_equal(store.read(t), cogs.data[t])

@@ -1,4 +1,4 @@
-"""Lossless roundtrip, pyramid values, anchor schedule, volatility, encoder input checks."""
+"""Lossless roundtrip, pyramid values, volatility, encoder input checks."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import pytest
 import xarray as xr
 
 import chronozarr
-from chronozarr import schema
 from tests.synthetic import (
     BANDS,
     CRS,
@@ -15,7 +14,6 @@ from tests.synthetic import (
     build_store,
     make_da,
     make_truth,
-    reference_anchor_schedule,
     reference_downsample,
 )
 
@@ -40,10 +38,10 @@ def test_lossless_roundtrip_every_timestep_and_level(tmp_path, shard):
 
 
 @pytest.mark.parametrize("shard", [True, False], ids=["sharded", "unsharded"])
-def test_multiple_anchors_multi_cell_pyramid(tmp_path, shard):
-    # 9 timesteps, anchors 0/4/8; 40x50 px with 16 px cells -> grids 3x4, 2x2, 1x1.
+def test_multiple_timesteps_multi_cell_pyramid(tmp_path, shard):
+    # 9 timesteps; 40x50 px with 16 px cells -> grids 3x4, 2x2, 1x1.
     truth = make_truth(9, 2, 40, 50)
-    build_store(tmp_path / "s", truth, shard=shard, anchor_interval=4, chunk_size=16)
+    build_store(tmp_path / "s", truth, shard=shard, chunk_size=16)
     store = chronozarr.open_store(tmp_path / "s")
 
     assert [lvl.grid for lvl in store.levels] == [(3, 4), (2, 2), (1, 1)]
@@ -65,46 +63,6 @@ def test_downsample_excludes_nodata_and_keeps_all_nodata_blocks():
     out = downsample_2x(level[0])
     assert out.tolist() == [[[10, 6], [0, 0]]]
     assert np.array_equal(out[None], reference_downsample(level))
-
-
-@pytest.mark.parametrize(
-    ("n_time", "interval"), [(1, 6), (5, 1), (7, 3), (12, 6), (13, 4), (9, 4)]
-)
-def test_anchor_schedule_matches_brute_force(n_time, interval):
-    anchors, reference = schema.compute_anchor_schedule(n_time, interval)
-    assert anchors == list(range(0, n_time, interval))
-    assert reference == reference_anchor_schedule(n_time, interval)
-
-
-def test_volatility_is_mean_abs_delta_per_cell(tmp_path):
-    truth = make_truth(5, 1, 40, 50)
-    build_store(tmp_path / "s", truth, shard=True, anchor_interval=2, chunk_size=16)
-    root = chronozarr.open_store(tmp_path / "s")
-    import zarr
-
-    volatility = zarr.open_group(str(tmp_path / "s"), mode="r")["volatility"][:]
-    reference = schema.compute_anchor_schedule(5, 2)[1]
-    assert volatility.shape == root.levels[0].grid == (3, 4)
-    for r in range(3):
-        for c in range(4):
-            ys, xs = slice(r * 16, (r + 1) * 16), slice(c * 16, (c + 1) * 16)
-            deltas = [
-                np.abs(truth[t, :, ys, xs].astype(np.int32) - truth[a, :, ys, xs].astype(np.int32))
-                for t, a in reference.items()
-            ]
-            expected = np.clip(np.mean(np.concatenate([d.ravel() for d in deltas])) / 10000, 0, 1)
-            assert volatility[r, c] == pytest.approx(expected, rel=1e-5)
-
-
-def test_anchor_interval_one_has_no_deltas_and_zero_volatility(tmp_path):
-    truth = make_truth(3, 1, 20, 20)
-    build_store(tmp_path / "s", truth, shard=True, anchor_interval=1, chunk_size=16)
-    store = chronozarr.open_store(tmp_path / "s")
-    import zarr
-
-    assert store.attrs.temporal.delta_reference == {}
-    assert np.array_equal(store.to_xarray().values, truth)
-    assert not zarr.open_group(str(tmp_path / "s"), mode="r")["volatility"][:].any()
 
 
 def test_encode_accepts_transform_from_coordinates(tmp_path):

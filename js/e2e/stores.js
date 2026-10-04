@@ -14,10 +14,7 @@ const withNodataColumns = (dtype, nodataValue) => {
   return (t, b, y, x, lod = 0) => (x < NODATA_COLUMNS ? nodataValue : values(t, b, y, x, lod));
 };
 
-/**
- * Up to 120 brighter or darker than the smooth default depending on the timestep, so the residual against an anchor is
- * negative for some pixels and star-delta has to wrap modulo 2^16, which is what stored residuals of real scenes do.
- */
+/** Pixel values vary by up to 120 around the smooth default. */
 const wobbled = (nodataValue) => {
   const values = withNodataColumns('uint16', nodataValue);
   return (t, b, y, x, lod = 0) => {
@@ -29,7 +26,7 @@ const wobbled = (nodataValue) => {
 /** Sentinel-2 band names in file order: blue, green, red, nir. */
 const S2_BANDS = ['B02', 'B03', 'B04', 'B08'];
 const ALL_PRODUCTS = ['True color', 'False color', 'NDVI', 'NDWI', 'Water', 'Single band'];
-const BASE = { height: 200, width: 200, chunk: 128, nTime: 6, anchorInterval: 3, sharded: true, nLevels: 2, consolidated: true };
+const BASE = { height: 200, width: 200, chunk: 128, nTime: 6, sharded: true, nLevels: 2, consolidated: true };
 const GEOREFERENCE = [10, 0, 500000, 0, -10, 4000000];
 
 /**
@@ -38,8 +35,8 @@ const GEOREFERENCE = [10, 0, 500000, 0, -10, 4000000];
  * must be enabled, in button order.
  */
 export const STORES = {
-  // Star-delta residuals (anchors at t = 0 and 3), sharded, v0.1 shapes: band names only, Sentinel-2 reflectance.
-  u16_stardelta: {
+  // True-value sharded Sentinel-2 reflectance.
+  u16_sharded: {
     dtype: 'uint16',
     spec: { ...BASE, nBand: 4, bands: S2_BANDS, nodata: 0, transform: GEOREFERENCE, values: wobbled(0) },
     enabledProducts: ALL_PRODUCTS,
@@ -47,16 +44,16 @@ export const STORES = {
   // No temporal encoding, one file per chunk.
   u16_plain: {
     dtype: 'uint16',
-    spec: { ...BASE, nTime: 4, sharded: false, encoding: 'none', nBand: 4, bands: S2_BANDS, nodata: 0, transform: GEOREFERENCE, values: wobbled(0) },
+    spec: { ...BASE, nTime: 4, sharded: false, nBand: 4, bands: S2_BANDS, nodata: 0, transform: GEOREFERENCE, values: wobbled(0) },
     enabledProducts: ALL_PRODUCTS,
   },
-  // Display-ready 8-bit RGB with star-delta residuals that wrap modulo 256.
+  // Display-ready 8-bit true-value RGB.
   u8_rgb: {
     dtype: 'uint8',
     spec: {
       ...BASE,
       nBand: 3,
-      specVersion: '0.2.0',
+      specVersion: '0.3.0',
       nodata: 0,
       bandObjects: [{ name: 'r', common_name: 'red', scale: 1 }, { name: 'g', common_name: 'green', scale: 1 }, { name: 'b', common_name: 'blue', scale: 1 }],
       values: withNodataColumns('uint8', 0),
@@ -68,8 +65,7 @@ export const STORES = {
     spec: {
       ...BASE,
       nBand: 1,
-      specVersion: '0.2.0',
-      encoding: 'none',
+      specVersion: '0.3.0',
       nodata: -9999,
       bandObjects: [{ name: 'elev', units: 'm', scale: 1 }],
       values: withNodataColumns('int16', -9999),
@@ -82,8 +78,7 @@ export const STORES = {
     spec: {
       ...BASE,
       nBand: 1,
-      specVersion: '0.2.0',
-      encoding: 'none',
+      specVersion: '0.3.0',
       nodata: null,
       bandObjects: [{ name: 'depth', units: 'm', scale: 2, offset: -1 }],
       values: withNodataColumns('float32', NaN),
@@ -93,14 +88,14 @@ export const STORES = {
   // A mask variable (1 valid, 0 invalid) at every level; see maskValue in synthetic-store.js for the pattern.
   u16_mask: {
     dtype: 'uint16',
-    spec: { ...BASE, nBand: 4, bands: S2_BANDS, specVersion: '0.2.0', nodata: 0, mask: true, transform: GEOREFERENCE, values: wobbled(0) },
+    spec: { ...BASE, nBand: 4, bands: S2_BANDS, specVersion: '0.3.0', nodata: 0, mask: true, transform: GEOREFERENCE, values: wobbled(0) },
     enabledProducts: ALL_PRODUCTS,
   },
   // 1792 x 1024 pixels x 4 bands: a level-0 frame of 14.7 MB that takes over a second at the bandwidth the viewer
   // assumes before it has measured any, so the viewer stages it (a coarse level first). One file per chunk.
   coarse: {
     dtype: 'uint16',
-    spec: { nTime: 2, nBand: 4, height: 1024, width: 1792, chunk: 512, anchorInterval: 2, sharded: false, nLevels: 3, bands: S2_BANDS, consolidated: true, nodata: 0 },
+    spec: { nTime: 2, nBand: 4, height: 1024, width: 1792, chunk: 512, sharded: false, nLevels: 3, bands: S2_BANDS, consolidated: true, nodata: 0 },
     enabledProducts: ALL_PRODUCTS,
   },
 };

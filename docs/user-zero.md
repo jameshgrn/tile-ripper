@@ -1,5 +1,9 @@
 # User zero: monthly water-mask stacks
 
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
+
+The measurements below describe historical v0.2 artifacts, not current writer options. Convert those stores before opening them with v0.3 libraries.
+
 Two derived chronozarr stores, built from the Sentinel-2 monthly mosaics that already sit in
 `data/mosaics/`, to see what a fluvial geomorphologist can do with the viewer: scrub months, click a
 pixel, chart it. Nothing was downloaded.
@@ -19,7 +23,7 @@ pixel, chart it. Nothing was downloaded.
 | Floor binding | 116 of 117 months | 9 of 94 months |
 
 `auto` did not measure anything: for `int16` data the writer always uses `none` (spec 4.3), so there
-is no star-delta ratio to report. Codec zstd level 5, 4 pyramid levels. Both `water-1` stores are sharded, (T, 2, 512, 512), the encoder default when they were built. `ucayali_santa_maria/water-2` is the Ucayali store rebuilt unsharded, the default now: 17,088 files, 1730.5 MB, and every value, mask plane and coverage plane identical to `water-1` at every level, timestep and cell. Lake Mead has no `water-2`.
+is no temporal compression ratio to report. Codec zstd level 5, 4 pyramid levels. Both `water-1` stores are sharded, (T, 2, 512, 512), the encoder default when they were built. `ucayali_santa_maria/water-2` is the Ucayali store rebuilt unsharded, the default now: 17,088 files, 1730.5 MB, and every value, mask plane and coverage plane identical to `water-1` at every level, timestep and cell. Lake Mead has no `water-2`.
 The table records the original sharded build. Ucayali was subsequently rebuilt and uploaded as `water-2` on 2026-10-01; Lake Mead remained local. The current demo catalog lists imagery (`chronozarr-4`) and PNG frames (`png-1`), not either water store. The water suffixes identify dataset revisions, not spec or package versions. The historical bucket budget is not a current capacity check.
 
 To preview the upload of an existing unsharded Ucayali build, the script takes its store name from `STORE`:

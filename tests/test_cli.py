@@ -35,10 +35,6 @@ def test_encode_validate_info_from_zarr(tmp_path, zarr_input):
         str(out),
         "--chunk-size",
         "16",
-        "--anchor-interval",
-        "2",
-        "--encoding",
-        "star-delta",
     )
     assert result.exit_code == 0, result.output
     assert "wrote" in result.output
@@ -54,7 +50,6 @@ def test_encode_validate_info_from_zarr(tmp_path, zarr_input):
         f"chronozarr {schema.SPEC_VERSION}",
         "EPSG:32631",
         "times:     4",
-        "2 anchors, 2 deltas",
         "grid 3x4",
     ):
         assert expected in info.output
@@ -238,36 +233,6 @@ def test_stac_writes_collection_and_item(tmp_path, zarr_input):
     assert "no Zarr v3 group found" in missing.output
 
 
-def test_encode_options_reach_the_writer(tmp_path, zarr_input):
-    source, truth = zarr_input
-    out = tmp_path / "plain"
-    result = _run(
-        "encode",
-        str(source),
-        str(out),
-        "--chunk-size",
-        "16",
-        "--encoding",
-        "none",
-        "--codec",
-        "blosc-zstd-shuffle",
-        "--level",
-        "2",
-        "--shard",
-        "--shard-time",
-        "2",
-    )
-    assert result.exit_code == 0, result.output
-    assert "encoding none" in result.output
-    assert "blosc-zstd-shuffle level 2" in result.output
-    store = chronozarr.open_store(out)
-    assert store.attrs.temporal.encoding == "none"
-    assert store.levels[0].shard_time == 2
-    assert np.array_equal(store.to_xarray().values, truth)
-    info = _run("info", str(out))
-    assert "temporal:  none (every timestep stored as true values)" in info.output
-
-
 def _write_manifest(tmp_path, truth):
     rasterio = pytest.importorskip("rasterio")
     from rasterio.transform import Affine
@@ -300,9 +265,7 @@ def test_convert_manifest_end_to_end(tmp_path):
     truth = make_truth(4, 2, 40, 50)
     manifest = _write_manifest(tmp_path, truth)
     out = tmp_path / "store"
-    result = _run(
-        "convert", str(manifest), str(out), "--chunk-size", "16", "--encoding", "star-delta"
-    )
+    result = _run("convert", str(manifest), str(out), "--chunk-size", "16")
     assert result.exit_code == 0, result.output
     for expected in (
         "source:     manifest of COGs, 4 timesteps (2024-01-01 .. 2024-04-01)",

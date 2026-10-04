@@ -25,7 +25,7 @@ chronozarr doctor https://your-host/my_store
 
 ## Encoding and storage
 
-`--encoding auto|none|star-delta` controls temporal encoding. The default is `auto`.
+v0.3 writes true stored values. Use `chronozarr convert OLD_STORE NEW_STORE` to migrate v0.2.
 `--shard` opts into sharding; `--shard-time` requires it. The default is unsharded.
 Use [the append guide](/guides/append) to choose a layout for growing stores.
 
@@ -36,5 +36,5 @@ chronozarr export-cog my_store cogs/
 chronozarr stac my_store --out catalog/
 ```
 
-COG export reconstructs star-delta values. Static STAC metadata points clients to
+COG export writes true stored values. Static STAC metadata points clients to
 the store; it does not serve rendered tiles.

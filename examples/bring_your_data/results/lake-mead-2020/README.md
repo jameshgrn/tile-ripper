@@ -1,5 +1,7 @@
 # Real-data adoption run: Lake Mead vicinity
 
+Historical v0.2 results and artifacts below are preserved as recorded. They do not describe v0.3 writer options; use explicit conversion before reading the stores with v0.3.
+
 Verified locally on 2026-10-02. This is a three-observation workflow check, not an independent
 user adoption, scientific validation, continental-scale test, or CDN performance result.
 

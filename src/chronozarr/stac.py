@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from chronozarr import schema
 from chronozarr.decode import ChronoStore, open_store
 from chronozarr.doctor import is_url
 
@@ -99,13 +100,6 @@ def _cube(store: ChronoStore, bounds: tuple[float, float, float, float]) -> tupl
     left, bottom, right, top = bounds
     crs = _epsg_number(store.attrs.crs)
     times = list(store.attrs.times)
-    encoding = getattr(store.attrs.temporal, "encoding", "star-delta")
-    caveat = (
-        " Non-anchor timesteps hold residuals against an anchor timestep; read them with "
-        "chronozarr (Python or the chronozarr JS reader), not a plain Zarr reader."
-        if encoding == "star-delta" and len(store.attrs.temporal.delta_reference) > 0
-        else ""
-    )
     dimensions = {
         "x": {
             "type": "spatial",
@@ -134,7 +128,7 @@ def _cube(store: ChronoStore, bounds: tuple[float, float, float, float]) -> tupl
         "dimensions": ["time", "band", "y", "x"],
         "data_type": str(level.data.dtype),
         "description": "Pixel values of the store at pyramid level 0 (stored at the native "
-        "resolution, 2x coarser per level)." + caveat,
+        "resolution, 2x coarser per level).",
     }
     if store.attrs.nodata is not None:
         data_variable["nodata"] = store.attrs.nodata
@@ -173,8 +167,6 @@ def build_stac(
     bands = _band_objects(store)
     provenance = getattr(store.attrs, "provenance", None)
     provenance = provenance if isinstance(provenance, dict) else None
-    temporal = store.attrs.temporal
-    encoding = getattr(temporal, "encoding", "star-delta")
     text = description or (
         f"chronozarr time series: {len(times)} timesteps, {len(bands)} bands, "
         f"{abs(a):g} m pixels in {store.attrs.crs}, {len(store.levels)} pyramid levels."
@@ -200,8 +192,9 @@ def build_stac(
         "cube:dimensions": dimensions,
         "cube:variables": variables,
         "chronozarr:spec_version": store.attrs.spec_version,
-        "chronozarr:temporal_encoding": encoding,
-        "chronozarr:anchor_interval": temporal.anchor_interval,
+        "chronozarr:zarr_conventions": [
+            schema.registration(n) for n in ("multiscales", "proj", "spatial")
+        ],
         "chronozarr:levels": [
             {
                 "path": str(lv.index),

@@ -18,7 +18,7 @@ import { startStaticServer } from '../support/static-server.js';
 import { filesFetch } from '../support/files-fetch.js';
 import { buildSyntheticStore, defaultValues } from '../support/synthetic-store.js';
 
-const SPEC = { nBand: 2, height: 40, width: 33, chunk: 32, anchorInterval: 2, sharded: true, shardTime: 4, specVersion: '0.2.0', shardBytes: true };
+const SPEC = { nBand: 2, height: 40, width: 33, chunk: 32,  sharded: true, shardTime: 4, specVersion: '0.3.0', shardBytes: true };
 /** t 0-3 in shard 0, t 4-5 in the trailing shard 1; a 2 x 2 grid of cells. */
 const OLD = { ...SPEC, nTime: 6 };
 /** The same store after appending t=6: shard 1 holds t 4-6. */
@@ -114,7 +114,7 @@ test('a stale reader reads the grown trailing shard: one root refetch past the c
   assert.equal(shard[1].range, `bytes=${grown.length - INDEX_BYTES}-${grown.length - 1}`, 'the refreshed hint: a bounded range, not a HEAD or a suffix');
   assert.ok(shard.every((r) => r.method === 'GET' && /^bytes=\d+-\d+$/.test(r.range)), 'only bounded ranges (no preflight on a cross-origin host)');
   assert.equal(shard.length, 4, 'stale index, fresh index, then the chunks of t=5 and t=4 (the index is shared)');
-  assert.deepEqual(shard.slice(2).map((r) => r.range).sort(), [`bytes=0-${CHUNK_BYTES - 1}`, `bytes=${CHUNK_BYTES}-${2 * CHUNK_BYTES - 1}`], 'anchor 4 and delta 5, at the offsets they always had');
+  assert.deepEqual(shard.slice(2).map((r) => r.range).sort(), [`bytes=0-${CHUNK_BYTES - 1}`, `bytes=${CHUNK_BYTES}-${2 * CHUNK_BYTES - 1}`], 'timesteps 4 and 5, at the offsets they always had');
   assert.equal(site.requests.filter((r) => r.cacheControl !== null).length, 1, 'only the root refetch bypassed the cache');
 });
 
@@ -226,7 +226,7 @@ test('the fallback is a real suffix range with suffixRequests', async (t) => {
   const store = await openStore(site.url, { workers: 0, suffixRequests: true });
   await assertCell(store, 0, 0, 5);
   const ranges = forObject(site, shardKey(0, 0)).map((r) => r.range);
-  assert.equal(ranges.length, 4);
+  assert.equal(ranges.length, 3);
   assert.equal(ranges[0], `bytes=${length - 100 - INDEX_BYTES}-${length - 101}`, 'the wrong hint');
   assert.equal(ranges[1], `bytes=-${INDEX_BYTES}`, 'then one suffix request, no HEAD');
   assert.equal(forObject(site, shardKey(0, 0)).filter((r) => r.method === 'HEAD').length, 0);

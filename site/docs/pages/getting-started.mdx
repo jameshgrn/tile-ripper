@@ -38,7 +38,7 @@ da = xr.DataArray(
 
 # A new output directory each run; encode does not overwrite a populated store.
 path = Path(tempfile.mkdtemp(prefix="chronozarr-quickstart-")) / "my_store"
-chronozarr.encode(da, path, crs="EPSG:32631", encoding="none", nodata=None)
+chronozarr.encode(da, path, crs="EPSG:32631", nodata=None)
 store = chronozarr.open_store(path)
 np.testing.assert_array_equal(store.read(t=1), values[1])
 print(path)
@@ -51,17 +51,15 @@ chronozarr validate /path/printed/by/the/script/my_store
 chronozarr info /path/printed/by/the/script/my_store
 ```
 
-Here `encoding="none"` makes every timestep readable by ordinary compatible Zarr v3
-clients. The normal writer default, `auto`, samples the data and enables star-delta
-only where it saves enough compressed bytes. `nodata=None` keeps zero as a valid value.
+v0.3 stores true values. Convert v0.2 stores with `chronozarr convert OLD_STORE NEW_STORE`.
 
 ## Read with xarray
 
 ```python
-# Reconstruct temporal encoding and return physical values by default.
+# Return physical values by default.
 ds = xr.open_dataset(path, engine="chronozarr")
 
-# This example has encoding none, so a plain Zarr reader also sees true values.
+# A plain Zarr reader sees true stored values.
 plain = xr.open_zarr(path, group="0", zarr_format=3, chunks=None)
 ```
 

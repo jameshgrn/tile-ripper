@@ -2,7 +2,7 @@
 
 Opening reads metadata only. The data variable is a lazily indexed array: selecting a window,
 or computing one dask chunk, reads exactly the Zarr chunks it needs (one chunk per timestep,
-plus the anchor chunk for a star-delta timestep) and returns decoded values. With
+ordinary stored values) and returns decoded values. With
 `physical=True` (default) values are float32 physical values (stored * scale + offset) with NaN
 where the pixel is invalid; with `physical=False` they are the stored values.
 
@@ -155,8 +155,7 @@ def open_dataset(
         "transform": list(level.transform),
         "resolution": level.resolution,
         "lod": lod,
-        "spec_version": store.attrs.spec_version,
-        "temporal_encoding": store.attrs.temporal.encoding,
+        "chronozarr_spec_version": store.attrs.spec_version,
     }
     if store.nodata is not None and level.mask is None:  # a mask carries validity instead
         attrs["nodata"] = store.nodata

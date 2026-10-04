@@ -26,5 +26,5 @@ title: Raster time series, ready to explore.
     <section><h2>Publish it</h2><p>Upload static objects to a bucket. Check CORS, byte ranges, and decoding with the doctor command.</p><a href="/publishing">Set up hosting</a></section>
     <section><h2>Use it anywhere</h2><p>Analyze in Python, fetch cells in JavaScript, add a MapLibre layer, or embed the chronozarr viewer.</p><a href="/integrate">Choose an integration</a></section>
   </div>
-  <aside className="cz-compat"><strong>Plain Zarr, with an optional temporal encoding.</strong>With encoding <code>none</code>, compatible Zarr v3 clients read true values directly. With <code>star-delta</code>, a chronozarr reader reconstructs residual timesteps from their anchors. Level 0 preserves stored values; coarser levels are block means. <a href="/how-it-works">See how it works</a>.</aside>
+  <aside className="cz-compat"><strong>True-value Zarr v3.</strong>chronozarr v0.3 builds on zarr-conventions multiscales, proj and spatial v0.1. Compatible clients read true stored values directly. Level 0 preserves stored values; coarser levels are block means. <a href="/how-it-works">See how it works</a>.</aside>
 </div>

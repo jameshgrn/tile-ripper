@@ -8,7 +8,7 @@ const EMPTY_STYLE = { version: 8, sources: {}, layers: [{ id: 'background', type
 test('MapLibre demo: the layer opens a synthetic store, reports ready, follows time and product, and reads values under a click', async ({ page, servers, storeUrl }) => {
   await page.route(/^https:\/\/cdn\.jsdelivr\.net\//, (route) => route.continue());
   await page.route('https://demotiles.maplibre.org/style.json', (route) => route.fulfill({ json: EMPTY_STYLE }));
-  const storeName = 'u16_stardelta';
+  const storeName = 'u16_sharded';
   await page.goto(`${servers.appUrl}/maplibre/index.html?store=${encodeURIComponent(await storeUrl(storeName))}`);
 
   const status = page.locator('#status');

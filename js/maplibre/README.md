@@ -1,8 +1,10 @@
 # chronozarr on MapLibre
 
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
+
 `ChronozarrLayer` draws a chronozarr store on a MapLibre GL JS map as a custom layer. It opens the store with
 `js/chronozarr/decoder.js`, picks the pyramid level from the map zoom, uploads the raw chunks of the visible cells
-as integer (or float) textures, and reconstructs star-delta timesteps and runs the product band math in the
+as integer (or float) textures, and runs the product band math in the
 fragment shader. Each cell is a small mesh whose vertices were projected from the store's CRS to Web Mercator, so
 the raster lands on the basemap with no resampling step. No dependencies: MapLibre is the host page's.
 
@@ -21,7 +23,7 @@ import { ChronozarrLayer } from './js/maplibre/layer.js';
 
 const map = new maplibregl.Map({ container: 'map', style: 'https://demotiles.maplibre.org/style.json' });
 const layer = new ChronozarrLayer({
-  url: 'https://data.tileripper.com/ucayali_santa_maria/chronozarr-4', // store root (holds zarr.json)
+  url: 'https://your-host/v03-store', // store root (holds zarr.json)
   product: 'true_color', // see layer.products; 'band' shows one band
   t: 0, // timestep index
   prefetch: true, // fill the reader's caches around t in the background (default false)
@@ -58,8 +60,7 @@ cache (`layer.store`) holds decoded chunks. While a new timestep loads, the prev
 its cache and speculative-bandwidth budgets), which is what makes scrubbing a whole time series smooth; it can move
 hundreds of MB (the demo moved 260 MB in 40 s for a 4-cell view of the Ucayali store).
 
-Stores written to spec v0.2 work as they are: `uint8`, `uint16`, `int16` and `float32` data, star-delta (modular
-residuals) or no temporal encoding, per-band `scale` and `offset`, `nodata` or a validity `mask`. The product colors
+Stores written to spec v0.3 work as they are: `uint8`, `uint16`, `int16` and `float32` true stored data, per-band `scale` and `offset`, `nodata` or a validity `mask`. The product colors
 are `PRODUCT_GLSL` from `js/shared/products-glsl.js`, the same shader code as the viewer, and `displayMode` decides
 between the tone-mapped reflectance look and a linear stretch (an 8-bit RGB store is shown as stored; other single
 bands get the 2nd to 98th percentile of the valid values on screen, or `range: [min, max]` in physical units).
@@ -80,8 +81,7 @@ bands get the 2nd to 98th percentile of the valid values on screen, or `range: [
 - **Footprint.** Coarse levels are padded to whole texels; the layer draws only the part inside the level-0 footprint,
   so the outline does not move when the level changes.
 - **Memory budget.** GPU: `gpuBudgetBytes` (default 256 MiB) sets the texture pool, in slots of one chunk
-  (`n_band * chunk^2 * bytes`; 2 MiB for 4 bands of uint16 at 512 px, so 128 slots); a cell on screen needs two slots
-  (anchor and delta, one for unencoded stores), plus one per chunk of a mask. A view that needs more cells than half the
+  (`n_band * chunk^2 * bytes`; 2 MiB for 4 bands of uint16 at 512 px, so 128 slots); a cell on screen needs one data slot, plus one per chunk of a mask. A view that needs more cells than the available
   slots draws the cells nearest the centre and emits an `error`. Uploads are capped at 16 MiB per frame. CPU: the reader
   caches (`storeOptions.totalBytes`, 1.5 GiB on machines reporting 8 GB or more and 768 MiB below, shared by the decoded and compressed tiers) are separate and are what make
   a warm time change a zero-request operation; `prefetch` fills them within those budgets.

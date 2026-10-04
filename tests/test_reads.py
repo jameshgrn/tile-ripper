@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import zarr
 from numcodecs import Zstd
 from zarr.abc.store import ByteRequest, SuffixByteRequest
 from zarr.storage import LocalStore, WrapperStore
@@ -50,7 +49,7 @@ class CountingStore(WrapperStore):
 def synthetic(request, tmp_path_factory):
     truth = make_truth(N_TIME, N_BAND, HEIGHT, WIDTH)
     path = tmp_path_factory.mktemp("reads") / "store"
-    build_store(path, truth, shard=request.param, anchor_interval=2)
+    build_store(path, truth, shard=request.param)
     return path, truth, request.param
 
 
@@ -61,51 +60,27 @@ def _counted(path):
     return store, counting
 
 
-def test_every_timestep_of_a_cell_costs_at_most_two_chunk_reads(synthetic):
+def test_every_timestep_reads_one_chunk(synthetic):
     path, _, sharded = synthetic
-    _, reference = schema.compute_anchor_schedule(N_TIME, 2)
     for t in range(N_TIME):
-        expected_times = {t} | ({reference[t]} if t in reference else set())
-        for row, col in [(0, 0), (0, 1), (1, 0), (1, 1)]:
-            store, counting = _counted(path)
-            store.read_cell(t, row, col)
-            reads = counting.data_reads()
-            if sharded:
-                index = [r for r in reads if r[1] == SuffixByteRequest(INDEX_BYTES)]
-                chunks = [r for r in reads if r not in index]
-                assert len(index) == 1, reads
-                assert {r[0] for r in reads} == {f"0/data/c/0/0/{row}/{col}"}
-                assert len(chunks) == len(expected_times), reads
-            else:
-                keys = {r[0] for r in reads}
-                assert keys == {f"0/data/c/{s}/0/{row}/{col}" for s in expected_times}, reads
-                assert len(reads) == len(expected_times)
-            assert len(expected_times) <= 2
-
-
-def test_anchor_timestep_reads_one_chunk_delta_reads_two(synthetic):
-    path, _, sharded = synthetic
-    for t, expected in [(0, 1), (1, 2), (2, 1)]:  # anchors 0 and 2; timestep 1 is a delta
         store, counting = _counted(path)
         store.read_cell(t, 0, 0)
         reads = counting.data_reads()
-        chunk_reads = len(reads) - 1 if sharded else len(reads)
-        assert chunk_reads == expected
+        assert len(reads) - (1 if sharded else 0) == 1
 
 
-def test_full_timestep_read_touches_only_its_anchor_and_delta(synthetic):
+def test_full_timestep_touches_only_its_own_chunks(synthetic):
     path, truth, sharded = synthetic
     store, counting = _counted(path)
     assert np.array_equal(store.read(1), truth[1])
     reads = counting.data_reads()
-    n_cells = 4
     if sharded:
-        index = [r for r in reads if r[1] == SuffixByteRequest(INDEX_BYTES)]
-        assert len(index) == n_cells
-        assert len(reads) - len(index) == 2 * n_cells
+        indices = [r for r in reads if r[1] == SuffixByteRequest(INDEX_BYTES)]
+        assert len(indices) == 4
+        assert len(reads) - len(indices) == 4
     else:
-        assert {int(key.split("/")[3]) for key, _ in reads} == {0, 1}
-        assert len(reads) == 2 * n_cells
+        assert {int(key.split("/")[3]) for key, _ in reads} == {1}
+        assert len(reads) == 4
 
 
 def test_edge_cells_have_exact_shape_and_values(synthetic):
@@ -166,19 +141,6 @@ def test_to_xarray_subset_and_coordinates(synthetic):
     y, x = schema.pixel_centers(store.levels[0].transform, HEIGHT, WIDTH)
     assert np.array_equal(da.y.values, y)
     assert np.array_equal(da.x.values, x)
-
-
-def test_reader_reconstruction_wraps_modulo_the_dtype(tmp_path):
-    truth = make_truth(2, 1, 8, 8)
-    truth[0] = 100
-    build_store(tmp_path / "s", truth, shard=False, anchor_interval=2, chunk_size=8)
-    data = zarr.open_array(str(tmp_path / "s" / "0" / "data"), mode="r+")
-    delta = np.full((1, 8, 8), -20000, dtype=np.int16)
-    delta[0, 0, 0] = 30000
-    data[1] = delta.view(np.uint16)
-    decoded = chronozarr.open_store(tmp_path / "s").read(1)
-    assert decoded[0, 1, 1] == 45636  # (100 - 20000) mod 65536, no clamping at 0
-    assert decoded[0, 0, 0] == 30100
 
 
 def test_open_store_rejects_non_stores(tmp_path):

@@ -31,7 +31,7 @@ async function coldOpenOnce(impl, url, { rows, cols, t, workers }) {
   const started = performance.now();
   const store = await open(impl, url, { workers });
   const openedAt = performance.now();
-  await Promise.all(cellsOf(rows, cols).map(([row, col]) => Promise.all([...new Set([store.anchorOf(t), t])].map((ct) => store.getRaw(0, row, col, ct)))));
+  await Promise.all(cellsOf(rows, cols).map(([row, col]) => Promise.all([t].map((ct) => store.getRaw(0, row, col, ct)))));
   const doneAt = performance.now();
   const stats = store.stats;
   const result = {
@@ -62,7 +62,7 @@ window.runFill = async ({ impl, url, rows = 6, cols = 6, t = 0, seconds = 5, wor
   const started = performance.now();
   const store = await open(impl, url, { workers, ...budgets });
   const cells = cellsOf(rows, cols);
-  await Promise.all(cells.map(([row, col]) => Promise.all([...new Set([store.anchorOf(t), t])].map((ct) => store.getRaw(0, row, col, ct)))));
+  await Promise.all(cells.map(([row, col]) => Promise.all([t].map((ct) => store.getRaw(0, row, col, ct)))));
   const coldMs = performance.now() - started;
   const coldBytes = store.stats.network.bytes;
   const abort = new AbortController();
@@ -97,7 +97,7 @@ window.runReopen = async ({ impl = 'new', url, rows = 2, cols = 2, t = 0, opens 
   for (let i = 0; i < opens; i++) {
     const started = performance.now();
     const store = await open(impl, url);
-    await Promise.all(cellsOf(rows, cols).map(([row, col]) => store.getRaw(0, row, col, store.anchorOf(t))));
+    await Promise.all(cellsOf(rows, cols).map(([row, col]) => store.getRaw(0, row, col, t)));
     times.push(round(performance.now() - started));
     store.close();
   }
@@ -127,7 +127,7 @@ window.runLive = async ({ url, cell = [2, 2], pixel = [16, 6], times = [60, 61, 
   const pixels = {};
   const loadStarted = performance.now();
   for (const t of times) {
-    await Promise.all([...new Set([store.anchorOf(t), t])].map((ct) => store.getRaw(0, cell[0], cell[1], ct)));
+    await Promise.all([t].map((ct) => store.getRaw(0, cell[0], cell[1], ct)));
     pixels[t] = Array.from(store.samplePixel(0, cell[0], cell[1], t, pixel[0], pixel[1]));
   }
   const out = {

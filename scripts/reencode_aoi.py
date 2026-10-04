@@ -6,7 +6,7 @@ iterable, so peak memory does not grow with the number of months. Prints wall ti
 
 Usage:
     uv run python scripts/reencode_aoi.py --aoi ucayali_santa_maria --store-name chronozarr-4
-    uv run python scripts/reencode_aoi.py --aoi sahara_tamanrasset --encoding none \
+    uv run python scripts/reencode_aoi.py --aoi sahara_tamanrasset \
         --codec blosc-zstd-shuffle
 """
 
@@ -137,8 +137,6 @@ def main() -> None:
     )
     parser.add_argument("--out-root", type=Path, default=DATA / "stores", help="stores directory")
     parser.add_argument("--months", type=int, default=None, help="encode only the first N months")
-    parser.add_argument("--encoding", choices=["auto", "none", "star-delta"], default="auto")
-    parser.add_argument("--anchor-interval", type=int, default=6)
     parser.add_argument("--codec", choices=["zstd", "blosc-zstd-shuffle"], default="zstd")
     parser.add_argument("--level", type=int, default=None, help="default: 5 zstd, 1 blosc")
     parser.add_argument("--chunk-size", type=int, choices=[256, 512], default=512)
@@ -178,8 +176,6 @@ def main() -> None:
         bands=s2_bands(grid.band_names),
         crs=f"EPSG:{grid.epsg}",
         transform=grid.transform,
-        encoding=args.encoding,
-        anchor_interval=args.anchor_interval,
         codec=args.codec,
         level=args.level,
         provenance=PROVENANCE,
@@ -203,13 +199,7 @@ def main() -> None:
             f"{lvl.encode_s:>8.2f} {lvl.write_s:>8.2f} {lvl.bytes / 1e6:>8.1f}"
         )
     print(f"\nencode total: {encode_s:.1f}s wall (spill + cells + metadata + consolidation)")
-    selection = report.selection
-    measured = (
-        f" (auto: star-delta/plain = {selection.ratio} on {selection.sampled_cells} cells)"
-        if selection
-        else ""
-    )
-    print(f"encoding: {report.encoding}{measured}; codec {report.codec} level {report.level}")
+    print(f"true values; codec {report.codec} level {report.level}")
     print(
         f"store: {report.total_bytes / 1e6:.1f} MB in {report.n_files} files "
         f"({raw_bytes / report.total_bytes:.2f}x vs raw)"

@@ -36,16 +36,13 @@ def _spill_dirs(parent: Path) -> list[Path]:
     return [p for p in parent.iterdir() if "spill" in p.name]
 
 
-@pytest.mark.parametrize("encoding", ["star-delta", "none"])
 @pytest.mark.parametrize("shard", [True, False], ids=["sharded", "unsharded"])
-def test_iterable_input_writes_the_same_store_as_a_dataarray(tmp_path, encoding, shard):
+def test_iterable_input_writes_the_same_store_as_a_dataarray(tmp_path, shard):
     truth = make_truth(5, 2, 29, 21)
     mask = (truth[:, 0] > 0).astype(np.uint8)
     coverage = (mask * 4).astype(np.uint8)
     kwargs = {
         "chunk_size": CS,
-        "anchor_interval": 2,
-        "encoding": encoding,
         "shard": shard,
         "shard_time": 2 if shard else None,
         "provenance": {"sources": ["x"], "composite": "median", "gap_fill": "none"},
@@ -86,8 +83,8 @@ def test_dask_backed_input_is_encoded_cell_by_cell(tmp_path):
     truth = make_truth(4, 2, 29, 21)
     da = make_da(truth, ["b0", "b1"])
     lazy = da.copy(data=da_dask.from_array(truth, chunks=(1, 2, CS, CS)))
-    chronozarr.encode(lazy, tmp_path / "lazy", chunk_size=CS, anchor_interval=2)
-    chronozarr.encode(da, tmp_path / "eager", chunk_size=CS, anchor_interval=2)
+    chronozarr.encode(lazy, tmp_path / "lazy", chunk_size=CS)
+    chronozarr.encode(da, tmp_path / "eager", chunk_size=CS)
     assert _tree(tmp_path / "lazy") == _tree(tmp_path / "eager")
 
 
@@ -96,7 +93,7 @@ def test_workers_does_not_change_the_output(tmp_path):
     trees = []
     for workers in (1, 3):
         out = tmp_path / f"w{workers}"
-        chronozarr.encode(make_da(truth), out, chunk_size=CS, workers=workers, encoding="none")
+        chronozarr.encode(make_da(truth), out, chunk_size=CS, workers=workers)
         trees.append(_tree(out))
     assert trees[0] == trees[1]
 
@@ -215,7 +212,6 @@ def test_peak_memory_is_a_fraction_of_the_raster(tmp_path):
             tmp_path / "s",
             chunk_size=cs,
             workers=2,
-            encoding="none",
             **{**_stream_kwargs(np.empty((n_time, n_band))), "bands": ["a", "b"]},
         )
         _, peak = tracemalloc.get_traced_memory()
@@ -242,7 +238,7 @@ def test_dataarray_encode_stays_bounded_beyond_its_input(tmp_path):
     )
     tracemalloc.start()
     try:
-        chronozarr.encode(da, tmp_path / "s", chunk_size=cs, workers=2, encoding="none")
+        chronozarr.encode(da, tmp_path / "s", chunk_size=cs, workers=2)
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()

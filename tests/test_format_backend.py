@@ -44,8 +44,6 @@ def store_path(request, tmp_path_factory):
         path,
         bands=BANDS,
         chunk_size=CS,
-        anchor_interval=2,
-        encoding="star-delta",
         shard=request.param,
         shard_time=2 if request.param else None,
         mask=mask,
@@ -74,7 +72,7 @@ def test_dataset_structure(store_path):
     assert list(ds["common_name"].values) == ["red", "nir"]
     assert np.issubdtype(ds["time"].dtype, np.datetime64)
     assert ds.attrs["crs"] == "EPSG:32631"
-    assert ds.attrs["temporal_encoding"] == "star-delta"
+    assert ds.attrs["chronozarr_spec_version"] == "0.3.0"
     assert "nodata" not in ds.attrs  # this store has a mask, which carries validity
     store = chronozarr.open_store(path)
     y, x = chronozarr.schema.pixel_centers(store.levels[0].transform, 40, 50)
@@ -144,7 +142,7 @@ def test_selection_reads_only_the_chunks_it_needs(store_path):
     counting = CountingStore(LocalStore(path, read_only=True))
     ds = xr.open_dataset(counting, engine=ChronozarrBackendEntrypoint)  # ty: ignore[invalid-argument-type]
     counting.reads.clear()
-    value = ds["data"].isel(time=1, y=slice(0, 10), x=slice(0, 10)).values  # anchor 0, delta 1
+    value = ds["data"].isel(time=1, y=slice(0, 10), x=slice(0, 10)).values
     assert value.shape == (2, 10, 10)
     data_keys = {k for k, _ in counting.reads if "/data/c/" in k}
     mask_keys = {k for k, _ in counting.reads if "/mask/c/" in k}
@@ -153,7 +151,7 @@ def test_selection_reads_only_the_chunks_it_needs(store_path):
         assert data_keys == {"0/data/c/0/0/0/0"}
         assert mask_keys == {"0/mask/c/0/0/0"}
     else:
-        assert data_keys == {"0/data/c/0/0/0/0", "0/data/c/1/0/0/0"}
+        assert data_keys == {"0/data/c/1/0/0/0"}
         assert mask_keys == {"0/mask/c/1/0/0"}
 
 
@@ -193,11 +191,11 @@ def test_engine_string_resolves_when_the_entry_point_is_registered(store_path):
 
 def test_no_data_variable_named_differently_is_supported(tmp_path):
     truth = make_truth(3, 1, 20, 20)
-    chronozarr.encode(make_da(truth, ["b"]), tmp_path / "s", chunk_size=CS, encoding="none")
+    chronozarr.encode(make_da(truth, ["b"]), tmp_path / "s", chunk_size=CS)
     ds = _open(tmp_path / "s")
     assert set(ds.data_vars) == {"data"}
     assert "common_name" not in ds.coords
-    assert ds.attrs["temporal_encoding"] == "none"
+    assert "temporal_encoding" not in ds.attrs
 
 
 # --- HTTP -------------------------------------------------------------------------------------
@@ -296,7 +294,7 @@ def test_xarray_backend_over_http(store_path, serve):
 
 def test_reads_survive_a_server_that_ignores_range(tmp_path, serve):
     truth = make_truth(4, 1, 40, 50)
-    chronozarr.encode(make_da(truth, ["b"]), tmp_path / "s", chunk_size=CS, encoding="star-delta")
+    chronozarr.encode(make_da(truth, ["b"]), tmp_path / "s", chunk_size=CS)
     url, handler = serve(tmp_path / "s")
     handler.ignore_range = True
     assert np.array_equal(chronozarr.open_store(url).to_xarray().values, truth)
@@ -313,9 +311,7 @@ def test_missing_objects_are_missing_keys_and_not_errors(tmp_path, serve):
 
 
 def test_transient_server_errors_are_retried_then_raise_with_the_url(tmp_path, serve):
-    chronozarr.encode(
-        make_da(make_truth(2, 1, 20, 20), ["b"]), tmp_path / "s", chunk_size=CS, encoding="none"
-    )
+    chronozarr.encode(make_da(make_truth(2, 1, 20, 20), ["b"]), tmp_path / "s", chunk_size=CS)
     url, handler = serve(tmp_path / "s")
     handler.fail_with, handler.failures_left = 503, 2
     assert chronozarr.open_store(url).levels[0].shape == (2, 1, 20, 20)  # 2 failures, then fine

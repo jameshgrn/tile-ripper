@@ -6,7 +6,7 @@ import { buildSyntheticStore, sourceValue } from '../support/synthetic-store.js'
 for (const sharded of [false, true]) {
   test(`a live viewer keeps old dates valid during append and sees new dates on reopen (${sharded ? 'sharded' : 'unsharded'})`, async ({ page, servers, stores }) => {
     const name = `append-${sharded}`;
-    const spec = { nBand: 1, height: 40, width: 33, chunk: 32, anchorInterval: 2, sharded, shardTime: 4, specVersion: '0.2.0', shardBytes: sharded, bands: ['wse'] };
+    const spec = { nBand: 1, height: 40, width: 33, chunk: 32, sharded, shardTime: 4, specVersion: '0.3.0', shardBytes: sharded, bands: ['wse'] };
     const publish = async nTime => {
       const files = buildSyntheticStore({ ...spec, nTime }).files;
       // Publish the root last, as the append writer does.

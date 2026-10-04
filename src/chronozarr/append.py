@@ -1,21 +1,4 @@
-"""chronozarr append: add timesteps to the end of an existing store.
-
-An append resizes the time axis of every level, writes only the objects that gain data (the
-shards or chunks holding the new timesteps), and rewrites the metadata that describes the
-longer axis. Every existing chunk keeps its bytes: star-delta references already recorded are
-never changed (spec 4.2), so what a published chunk decodes to cannot change. A shard that
-already holds earlier timesteps is rewritten with those chunks at the same offsets, followed
-by the new chunk and a new index.
-
-The new timesteps go through the same cell-by-cell pyramid as `encode`, so levels 1 and up are
-block means of the true values, exactly as a fresh encode would write them. A new timestep of
-a star-delta store references the nearest anchor that exists after the append (spec 4.2); an
-anchor from an earlier append is read back from the store, one chunk per cell and level.
-
-Appending is not transactional. Inputs are validated, and a source that is an iterable is
-spilled to disk, before the store is touched; a failure after that leaves the store partly
-modified. Run it on a working copy and publish after `chronozarr validate`.
-"""
+"""Append true-value timesteps using a validated working copy before publication."""
 
 from __future__ import annotations
 
@@ -46,6 +29,7 @@ from chronozarr._writer import (
     _Input,
     _iso_times,
     _LevelArrays,
+    _mean_comparison,
     _prepare_input,
     _Pyramid,
     _resolve_bands,
@@ -56,11 +40,11 @@ from chronozarr._writer import (
     _write_time_coord,
 )
 from chronozarr.decode import ChronoStore, open_store
-from chronozarr.schema import Band, Chronozarr, LevelRef, Temporal, Transform
+from chronozarr.schema import Band, Chronozarr, LevelRef, SchemaError, Transform
 
 # A `none` store does not record the nominal schedule its volatility was computed against
 # (spec 5); appended timesteps use the writer default.
-NOMINAL_ANCHOR_INTERVAL = 6
+COMPARISON_INTERVAL = 6
 
 
 @dataclass(frozen=True)
@@ -112,10 +96,6 @@ class _Target:
     def shapes(self) -> list[tuple[int, int]]:
         return [(a.data.shape[2], a.data.shape[3]) for a in self.arrays]
 
-    @property
-    def star_delta(self) -> bool:
-        return self.meta.temporal.encoding == schema.STAR_DELTA
-
 
 def _open_target(store: str | Path) -> _Target:
     path = Path(store)
@@ -132,11 +112,6 @@ def _open_target(store: str | Path) -> _Target:
     root = zarr.open_group(path, mode="r+", zarr_format=3, use_consolidated=False)
     parsed = schema.parse_root_attrs(root.attrs.asdict())
     meta = parsed.chronozarr
-    if not meta.spec_version.startswith("0.2."):
-        raise ValueError(
-            f"{store} is chronozarr {meta.spec_version}; append needs a 0.2 store "
-            "(re-encode it with this version first)"
-        )
     groups = [schema.get_group(root, d.path, "store") for d in parsed.datasets]
     arrays = []
     for group in groups:
@@ -286,127 +261,59 @@ def _band_conflict(new: Band, old: Band, *, strict: bool) -> bool:
 
 
 def _band_text(band: Band) -> str:
-    extras = {k: v for k, v in band.to_attrs().items() if k != "name"}
+    extras = {
+        k: v
+        for k, v in band.to_attrs().items()
+        if k != "name" and not (k == "scale" and v == 1.0) and not (k == "offset" and v == 0.0)
+    }
     return f"{band.name!r}" + (f" {extras}" if extras else "")
-
-
-# --- Schedule ------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class _Plan:
-    """What the new timesteps reference, and how the volatility moves."""
-
     old_n: int
     new_n: int
-    stored_refs: Mapping[int, int]  # new non-anchor timestep -> anchor; empty for plain stores
-    volatility_refs: Mapping[int, int]  # same, or the nominal schedule for plain stores
-    n_deltas_before: int  # non-anchor timesteps counted by the volatility before the append
-
-    @property
-    def n_deltas_after(self) -> int:
-        return self.n_deltas_before + len(self.volatility_refs)
 
 
 def _plan(target: _Target, n_new: int) -> _Plan:
-    old_n, new_n = target.n_time, target.n_time + n_new
-    temporal = target.meta.temporal
-    if target.star_delta:
-        anchors, schedule = schema.compute_anchor_schedule(new_n, temporal.anchor_interval)
-        if tuple(anchors[: len(temporal.anchor_indices)]) != temporal.anchor_indices:
-            raise AssertionError("anchor positions changed on append")
-        refs = {t: a for t, a in schedule.items() if t >= old_n}
-        return _Plan(old_n, new_n, refs, refs, len(temporal.delta_reference))
-    _, nominal_after = schema.compute_anchor_schedule(new_n, NOMINAL_ANCHOR_INTERVAL)
-    _, nominal_before = schema.compute_anchor_schedule(old_n, NOMINAL_ANCHOR_INTERVAL)
-    refs = {t: a for t, a in nominal_after.items() if t >= old_n}
-    return _Plan(old_n, new_n, {}, refs, len(nominal_before))
-
-
-# --- One cell ------------------------------------------------------------------------------------
-
-
-def _abs_diff_sum(a: np.ndarray, b: np.ndarray) -> float:
-    wide = np.float64 if a.dtype.kind == "f" else np.int32
-    return float(np.abs(a.astype(wide) - b.astype(wide)).sum(dtype=np.float64))
+    return _Plan(target.n_time, target.n_time + n_new)
 
 
 @dataclass(frozen=True)
 class _CellDone:
     seconds: float
-    abs_delta_gain: float  # sum of |value - anchor| over the new delta timesteps (level 0 only)
 
 
 def _append_cell(
-    block: Block,
-    arrays: _LevelArrays,
-    ys: slice,
-    xs: slice,
-    plan: _Plan,
-    *,
-    want_volatility: bool,
+    block: Block, arrays: _LevelArrays, ys: slice, xs: slice, plan: _Plan
 ) -> _CellDone:
-    """Write the new timesteps of one cell: star-delta applied, mask and coverage alongside."""
     started = time.perf_counter()
-    stored_anchors: dict[int, np.ndarray] = {}
-
-    def truth(t: int) -> np.ndarray:
-        """True values of timestep t: from the new block, or an anchor read back from the store."""
-        if t >= plan.old_n:
-            return block.data[t - plan.old_n]
-        if t not in stored_anchors:
-            stored_anchors[t] = np.asarray(arrays.data[t, :, ys, xs])
-        return stored_anchors[t]
-
-    stored = np.empty_like(block.data)
-    for j in range(block.data.shape[0]):
-        t = plan.old_n + j
-        anchor = plan.stored_refs.get(t)
-        if anchor is None:
-            stored[j] = block.data[j]
-        else:
-            np.subtract(block.data[j], truth(anchor), out=stored[j])  # unsigned wraps silently
-    arrays.data[plan.old_n : plan.new_n, :, ys, xs] = stored
+    arrays.data[plan.old_n : plan.new_n, :, ys, xs] = block.data
     if arrays.mask is not None and block.mask is not None:
         arrays.mask[plan.old_n : plan.new_n, ys, xs] = block.mask
     if arrays.coverage is not None and block.coverage is not None:
         arrays.coverage[plan.old_n : plan.new_n, ys, xs] = block.coverage
-
-    gain = 0.0
-    if want_volatility:
-        gain = sum(_abs_diff_sum(truth(t), truth(a)) for t, a in plan.volatility_refs.items())
-    return _CellDone(time.perf_counter() - started, gain)
+    return _CellDone(time.perf_counter() - started)
 
 
 # --- Metadata ------------------------------------------------------------------------------------
 
 
-def _update_volatility(target: _Target, plan: _Plan, gains: np.ndarray) -> None:
-    """Fold the new deltas into the per-cell mean |value - anchor| the volatility records.
-
-    The stored value is clip(mean / 10000), so the old sum is recovered as value * 10000 * count.
-    The result equals what the full computation over the recorded references gives, up to
-    float32 rounding; a cell already clipped at 1.0 stays at 1.0.
-    """
+def _update_volatility(target: _Target, plan: _Plan) -> None:
+    if target.meta.volatility_path is None:
+        return
     array = schema.get_array(target.root, target.meta.volatility_path, "store")
-    rows, cols = array.shape
-    cs, (height, width) = target.chunk_size, target.shapes[0]
-    n_band = len(target.meta.bands)
-    pixels = np.empty((rows, cols), dtype=np.float64)
-    for row in range(rows):
-        for col in range(cols):
-            cell_h = min(cs, height - row * cs)
-            cell_w = min(cs, width - col * cs)
-            pixels[row, col] = cell_h * cell_w * n_band
-    before = np.asarray(array[:], dtype=np.float64) * VOLATILITY_SCALE * plan.n_deltas_before
-    total = before * pixels + gains
-    if plan.n_deltas_after == 0:
-        updated = np.zeros((rows, cols))
-    else:
-        updated = total / (plan.n_deltas_after * pixels * VOLATILITY_SCALE)
-    new_values = np.clip(updated, 0.0, 1.0).astype(np.float32)
-    if not np.array_equal(new_values, np.asarray(array[:])):  # an anchor adds no deltas
-        array[:] = new_values
+    cs = target.chunk_size
+    updated = np.zeros(array.shape, dtype=np.float32)
+    reference = schema.comparison_schedule(plan.new_n, COMPARISON_INTERVAL)
+    for row in range(array.shape[0]):
+        for col in range(array.shape[1]):
+            block = np.asarray(
+                target.arrays[0].data[:, :, row * cs : (row + 1) * cs, col * cs : (col + 1) * cs]
+            )
+            total, count = _mean_comparison(block, reference)
+            updated[row, col] = np.clip(total / count / VOLATILITY_SCALE, 0, 1) if count else 0
+    array[:] = updated
 
 
 def _commit_metadata(
@@ -425,31 +332,19 @@ def _commit_metadata(
     for group in target.groups:
         _write_time_coord(group, all_ms, overwrite=True)
 
-    temporal = meta.temporal
-    if target.star_delta:
-        reference = {**temporal.delta_reference, **plan.stored_refs}
-        anchors, _ = schema.compute_anchor_schedule(plan.new_n, temporal.anchor_interval)
-        temporal = Temporal(
-            temporal.anchor_interval,
-            tuple(anchors),
-            reference,
-            schema.STAR_DELTA,
-            temporal.selection,
-        )
-    else:
-        temporal = Temporal.plain(plan.new_n, temporal.selection)
     levels = (
         None
         if meta.levels is None
         else tuple(replace(lv, shape=(plan.new_n, *lv.shape[1:])) for lv in meta.levels)
     )
     shard_bytes = (
-        None if meta.shard_bytes is None else _shard_bytes(target.path, len(target.datasets))
+        None
+        if meta.shard_bytes is None
+        else _shard_bytes(target.path, len(target.datasets), target.meta.variable)
     )
     updated = replace(
         meta,
         times=(*meta.times, *times_iso),
-        temporal=temporal,
         levels=levels,
         shard_bytes=shard_bytes,
     )
@@ -476,7 +371,7 @@ def _snapshot(path: Path) -> dict[str, tuple[int, int]]:
     return entries
 
 
-def append(
+def _append_in_place(
     store: str | Path,
     data: xr.DataArray | Iterable[np.ndarray] | str | Path | ChronoStore,
     *,
@@ -489,7 +384,7 @@ def append(
     workers: int | None = None,
     spill_dir: str | Path | None = None,
 ) -> AppendReport:
-    """Append timesteps to the end of the chronozarr v0.2 store at `store`, in place.
+    """Append timesteps to the end of the chronozarr v0.3 store at `store`, in place.
 
     Args:
         store: A local store directory that validates.
@@ -600,8 +495,6 @@ def _write(
                 array.resize((plan.new_n, *array.shape[1:]))
 
     cs = target.chunk_size
-    grid0 = schema.grid_shape(*target.shapes[0], cs)
-    gains = np.zeros(grid0, dtype=np.float64)
     writer = _CellWriter[_CellDone](cells_in_flight)
     compute = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
     pyramid = _Pyramid(
@@ -622,12 +515,12 @@ def _write(
             k,
             row,
             col,
-            lambda: _append_cell(block, target.arrays[k], ys, xs, plan, want_volatility=k == 0),
+            lambda: _append_cell(block, target.arrays[k], ys, xs, plan),
         )
 
     try:
         pyramid.walk(submit)
-        results = writer.results()
+        writer.results()
     except BaseException:
         writer.shutdown()
         raise
@@ -635,8 +528,46 @@ def _write(
         compute.shutdown(wait=True)
     writer.shutdown()
 
-    for k, row, col, done in results:
-        if k == 0:
-            gains[row, col] = done.abs_delta_gain
-    _update_volatility(target, plan, gains)
+    _update_volatility(target, plan)
     _commit_metadata(target, plan, times_iso, times_ms)
+
+
+def append(
+    store: str | Path,
+    data: xr.DataArray | Iterable[np.ndarray] | str | Path | ChronoStore,
+    **options: Any,
+) -> AppendReport:
+    """Validate append in a working copy, then publish only changed objects, root last.
+
+    Publication is metadata-last but not transactional across multiple objects.
+    """
+    original = Path(store)
+    _open_target(original)
+    working = Path(tempfile.mkdtemp(prefix=f".{original.name}-append-", dir=original.parent))
+    try:
+        shutil.copytree(original, working, dirs_exist_ok=True)
+        report = _append_in_place(working, data, **options)
+        problems = schema.validate(working)
+        if problems:
+            raise SchemaError("append validation failed: " + "; ".join(problems))
+        before, after = _snapshot(original), _snapshot(working)
+        changed = [key for key in after if before.get(key) != after[key]]
+
+        def order(key: str) -> tuple[int, str]:
+            if key == "zarr.json":
+                return 3, key
+            if key.endswith("/zarr.json"):
+                return 2, key
+            if "/time/" in key or key.startswith("volatility/"):
+                return 1, key
+            return 0, key
+
+        for key in sorted(changed, key=order):
+            destination = original / key
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(destination.name + ".append-part")
+            shutil.copy2(working / key, temporary)
+            temporary.replace(destination)
+        return report
+    finally:
+        shutil.rmtree(working)

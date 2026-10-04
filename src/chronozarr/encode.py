@@ -1,24 +1,7 @@
-"""chronozarr writer: optional star-delta temporal encoding plus a block-mean pyramid, as Zarr v3.
-
-Layout (see spec/CHRONOZARR.md and spec/CHANGES-0.2.md): a root group with `multiscales`,
-`chronozarr` and `volatility`; one group per pyramid level holding `data` (time, band, y, x) in
-one of four dtypes, optional `mask` and `coverage` planes (time, y, x), and coordinate arrays.
-
-With star-delta encoding, anchor timesteps store true values and the others store
-(value - nearest anchor) modulo 2^bits in the same array and dtype (uint8 or uint16 only). With
-encoding "none" the array holds true values. `encoding="auto"` measures both on a sample of
-level-0 cells and keeps star-delta only when it is clearly smaller.
-
-Memory is bounded by the cell size, not the raster size. The pyramid is built depth first: each
-cell of level k is assembled from the four cells of level k-1 beneath it, so a level-0 cell
-(every timestep of one 512 x 512 window) is read once, written, downsampled into its parent
-and dropped. Input is a DataArray (numpy or dask, read one cell at a time) or an iterable of
-per-timestep arrays, which is spilled once to cell-major temp files and read back per cell.
-"""
+"""True-value chronozarr v0.3 writer with a bounded-memory block-mean pyramid."""
 
 from __future__ import annotations
 
-import math
 import os
 import shutil
 import tempfile
@@ -26,12 +9,10 @@ import time
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-import numcodecs
-import numcodecs.abc
 import numpy as np
 import xarray as xr
 import zarr
@@ -53,6 +34,7 @@ from chronozarr._writer import (
     _CellWriter,
     _iso_times,
     _LevelArrays,
+    _mean_comparison,
     _prepare_input,
     _put_coord,
     _Pyramid,
@@ -79,19 +61,13 @@ from chronozarr.schema import (
     LevelRef,
     LevelSummary,
     RootAttrs,
-    Selection,
-    Temporal,
     Transform,
 )
 
-AUTO_RATIO_LIMIT = 0.85  # star-delta must be at most this fraction of the plain bytes
-AUTO_MIN_CELLS = 3
-AUTO_SAMPLE_FRACTION = 0.1
 DEFAULT_LEVEL = {"zstd": 5, "blosc-zstd-shuffle": 1}
 LEVEL_RANGE = {"zstd": (1, 22), "blosc-zstd-shuffle": (0, 9)}
 
 
-Encoding = Literal["auto", "none", "star-delta"]
 Codec = Literal["zstd", "blosc-zstd-shuffle"]
 
 
@@ -101,7 +77,7 @@ class LevelReport:
     shape: tuple[int, int, int, int]
     n_cells: int
     downsample_s: float  # producing this level from the one below, summed over threads
-    encode_s: float  # star-delta residuals + volatility, summed over threads
+    encode_s: float  # optional volatility, summed over threads
     write_s: float  # zarr write incl. compression, summed over threads
     bytes: int
 
@@ -111,66 +87,8 @@ class EncodeReport:
     levels: tuple[LevelReport, ...]
     total_bytes: int
     n_files: int
-    encoding: str  # the resolved temporal encoding: "none" or "star-delta"
-    selection: Selection | None  # the auto measurement, if one was made
     codec: str
     level: int  # compression level
-
-
-# --- Encoding choice --------------------------------------------------------------------------
-
-
-def _compressor_for(codec: str, level: int) -> numcodecs.abc.Codec:
-    if codec == "zstd":
-        return numcodecs.Zstd(level=level)
-    return numcodecs.Blosc(cname="zstd", clevel=level, shuffle=numcodecs.Blosc.SHUFFLE)
-
-
-def _compressed_size(compressor: numcodecs.abc.Codec, array: np.ndarray) -> int:
-    return len(compressor.encode(np.ascontiguousarray(array)))
-
-
-def _sample_cells(grid: tuple[int, int]) -> list[tuple[int, int]]:
-    """Evenly spread level-0 cells: max(3, 10 %) of them, or all if there are fewer than 3."""
-    rows, cols = grid
-    n_cells = rows * cols
-    wanted = min(n_cells, max(AUTO_MIN_CELLS, math.ceil(AUTO_SAMPLE_FRACTION * n_cells)))
-    picks = sorted({round(i) for i in np.linspace(0, n_cells - 1, wanted)})
-    return [(p // cols, p % cols) for p in picks]
-
-
-def _measure_star_delta(
-    source: _Source,
-    grid: tuple[int, int],
-    anchors: Sequence[int],
-    reference: Mapping[int, int],
-    codec: str,
-    level: int,
-    pool: ThreadPoolExecutor,
-) -> Selection:
-    """Compressed bytes of star-delta over plain on a sample of level-0 cells.
-
-    Both layouts compress the same inner chunks the store would hold: one (band, y, x) chunk
-    per timestep. Anchors are true values in both, so they count equally.
-    """
-    compressor = _compressor_for(codec, level)
-    plain_bytes = delta_bytes = 0
-    cells = _sample_cells(grid)
-    for row, col in cells:
-        block = source.read_cell(row, col)
-
-        def sizes(t: int, block: Block = block) -> tuple[int, int]:
-            plain = _compressed_size(compressor, block.data[t])
-            if t not in reference:
-                return plain, plain
-            residual = np.subtract(block.data[t], block.data[reference[t]])
-            return plain, _compressed_size(compressor, residual)
-
-        for plain, delta in pool.map(sizes, range(block.data.shape[0])):
-            plain_bytes += plain
-            delta_bytes += delta
-    ratio = delta_bytes / plain_bytes if plain_bytes else 1.0
-    return Selection(sampled_cells=len(cells), ratio=round(ratio, 4))
 
 
 # --- Cell encode and write --------------------------------------------------------------------
@@ -184,52 +102,20 @@ class _CellResult:
     n_delta_values: int
 
 
-def _residuals(
-    block: np.ndarray, anchors: Sequence[int], reference: Mapping[int, int]
-) -> np.ndarray:
-    """Star-delta layout: anchors as-is, others (value - anchor) modulo 2^bits in the dtype."""
-    out = np.empty(block.shape, dtype=block.dtype)
-    for anchor in anchors:
-        out[anchor] = block[anchor]
-    for t, anchor in reference.items():
-        np.subtract(block[t], block[anchor], out=out[t])  # unsigned arrays wrap silently
-    return out
-
-
-def _mean_abs_delta(block: np.ndarray, reference: Mapping[int, int]) -> tuple[float, int]:
-    """Sum of |value - anchor| over every delta timestep (true difference, not modular)."""
-    wide = np.float64 if block.dtype.kind == "f" else np.int32
-    by_anchor: dict[int, list[int]] = {}
-    for t, anchor in reference.items():
-        by_anchor.setdefault(anchor, []).append(t)
-    total = 0.0
-    count = 0
-    for anchor, steps in by_anchor.items():
-        base = block[anchor].astype(wide)
-        for t in steps:
-            diff = block[t].astype(wide)
-            diff -= base
-            total += float(np.abs(diff).sum(dtype=np.float64))
-            count += diff.size
-    return total, count
-
-
 def _encode_cell(
     block: Block,
     arrays: _LevelArrays,
     ys: slice,
     xs: slice,
     *,
-    star_delta: bool,
-    anchors: Sequence[int],
     reference: Mapping[int, int],
     shard_time: int,
     want_volatility: bool,
 ) -> _CellResult:
     """Encode one cell (every timestep) and write it, one time shard at a time."""
     started = time.perf_counter()
-    out = _residuals(block.data, anchors, reference) if star_delta else block.data
-    total, count = _mean_abs_delta(block.data, reference) if want_volatility else (0.0, 0)
+    out = block.data
+    total, count = _mean_comparison(block.data, reference) if want_volatility else (0.0, 0)
     encoded = time.perf_counter()
 
     n_time = block.data.shape[0]
@@ -294,7 +180,7 @@ class _Layout:
     has_coverage: bool
     codec: str
     level: int
-    anchor_interval: int
+    volatility: bool
 
     @property
     def fill_value(self) -> int | float:
@@ -323,13 +209,16 @@ def _create_level(root: zarr.Group, k: int, layout: _Layout) -> _LevelArrays:
             compressors=compressor,
             filters=None,
         )
-        attrs = schema.data_array_attrs(layout.crs, transform, height, width, dimensions=dims)
+        attrs = schema.data_array_attrs(
+            layout.crs, transform, height, width, layout.nodata, dimensions=dims
+        )
         return array, attrs
 
     data, attrs = create(
         schema.VARIABLE, (layout.n_band,), layout.dtype, layout.fill_value, schema.DIMENSIONS
     )
-    attrs["nodata"] = layout.nodata
+    if layout.nodata is not None:
+        attrs["nodata"] = layout.nodata
     data.attrs.update(attrs)
     planes: list[zarr.Array | None] = []
     for name, wanted in (
@@ -340,7 +229,7 @@ def _create_level(root: zarr.Group, k: int, layout: _Layout) -> _LevelArrays:
             planes.append(None)
             continue
         array, attrs = create(name, (), np.dtype("uint8"), 0, schema.PLANE_DIMENSIONS)
-        del attrs["nodata"]
+        attrs.pop("nodata", None)
         array.attrs.update(attrs)
         planes.append(array)
     _write_coords(group, transform, height, width, layout.times_ms, [b.name for b in layout.bands])
@@ -352,14 +241,11 @@ def _write_store(
     layout: _Layout,
     source: _Source,
     *,
-    star_delta: bool,
-    selection: Selection | None,
     provenance: dict | None,
     cells_in_flight: int,
 ) -> EncodeReport:
     cs = layout.chunk_size
-    schedule = schema.compute_anchor_schedule(layout.n_time, layout.anchor_interval)
-    anchors, reference = schedule
+    reference = schema.comparison_schedule(layout.n_time)
     root = zarr.open_group(str(out), mode="w", zarr_format=3)
     arrays = [_create_level(root, k, layout) for k in range(len(layout.shapes))]
     grids = [schema.grid_shape(h, w, cs) for h, w in layout.shapes]
@@ -389,11 +275,9 @@ def _write_store(
                 arrays[k],
                 ys,
                 xs,
-                star_delta=star_delta,
-                anchors=anchors,
                 reference=reference,
                 shard_time=layout.shard_time,
-                want_volatility=k == 0,
+                want_volatility=layout.volatility and k == 0,
             ),
         )
 
@@ -415,16 +299,17 @@ def _write_store(
             mean_abs = result.abs_delta_sum / result.n_delta_values
             volatility[row, col] = min(max(mean_abs / VOLATILITY_SCALE, 0.0), 1.0)
 
-    vol = root.create_array(
-        name=schema.VOLATILITY_PATH,
-        shape=volatility.shape,
-        chunks=volatility.shape,
-        dtype="float32",
-        fill_value=0.0,
-        dimension_names=("row", "col"),
-    )
-    vol[:] = volatility
-    vol.attrs["_ARRAY_DIMENSIONS"] = ["row", "col"]
+    if layout.volatility:
+        vol = root.create_array(
+            name=schema.VOLATILITY_PATH,
+            shape=volatility.shape,
+            chunks=volatility.shape,
+            dtype="float32",
+            fill_value=0.0,
+            dimension_names=("row", "col"),
+        )
+        vol[:] = volatility
+        vol.attrs["_ARRAY_DIMENSIONS"] = ["row", "col"]
 
     summaries = tuple(
         LevelSummary(
@@ -436,16 +321,11 @@ def _write_store(
         )
         for k in range(len(layout.shapes))
     )
-    temporal = (
-        Temporal.build(layout.n_time, layout.anchor_interval, selection)
-        if star_delta
-        else Temporal.plain(layout.n_time, selection)
-    )
     meta = Chronozarr(
         times=tuple(layout.times_iso),
         bands=layout.bands,
         crs=layout.crs,
-        temporal=temporal,
+        volatility_path=schema.VOLATILITY_PATH if layout.volatility else None,
         nodata=layout.nodata,
         mask_variable=schema.MASK_VARIABLE if layout.has_mask else None,
         coverage_variable=schema.COVERAGE_VARIABLE if layout.has_coverage else None,
@@ -477,8 +357,6 @@ def _write_store(
         ),
         total_bytes=total_bytes,
         n_files=n_files,
-        encoding=schema.STAR_DELTA if star_delta else schema.NONE,
-        selection=selection,
         codec=layout.codec,
         level=layout.level,
     )
@@ -505,8 +383,7 @@ def encode(
     transform: Sequence[float] | None = None,
     times: Sequence | np.ndarray | None = None,
     bands: Sequence[str | Band | Mapping] | None = None,
-    encoding: Encoding = "auto",
-    anchor_interval: int = 6,
+    volatility: bool = False,
     codec: Codec = "zstd",
     level: int | None = None,
     nodata: int | float | str | None = "default",
@@ -520,7 +397,7 @@ def encode(
     workers: int | None = None,
     spill_dir: str | Path | None = None,
 ) -> EncodeReport:
-    """Write `data` as a chronozarr v0.2 store at `out`.
+    """Write `data` as a chronozarr v0.3 store at `out`.
 
     Args:
         data: Either a DataArray with dims (time, band, y, x) whose dtype is uint8, uint16,
@@ -535,10 +412,7 @@ def encode(
         times: datetime64 timestamps, strictly increasing (iterable input only).
         bands: Band names, or Band objects / dicts {name, common_name, scale, offset, units}.
             Default: the DataArray band coordinate.
-        encoding: "auto" measures star-delta against plain storage on a sample of level-0 cells
-            and keeps star-delta only when its compressed bytes are at most 0.85 x the plain
-            bytes; "none" and "star-delta" force one. star-delta needs uint8 or uint16.
-        anchor_interval: Timesteps between anchors (1 = every timestep is an anchor).
+        volatility: Opt in to the optional cell-ordering metric (nominal interval 6).
         codec: "zstd" (default) or "blosc-zstd-shuffle" (blosc, zstd inside, byte shuffle).
         level: Compression level. Default 5 for zstd (1..22), 1 for blosc (0..9).
         nodata: Value marking invalid pixels, or None for none. "default" is 0 for uint8 and
@@ -568,10 +442,6 @@ def encode(
     """
     if chunk_size < 2 or chunk_size % 2:
         raise ValueError(f"chunk_size must be an even number, got {chunk_size}")
-    if anchor_interval < 1:
-        raise ValueError(f"anchor_interval must be >= 1, got {anchor_interval}")
-    if encoding not in ("auto", schema.NONE, schema.STAR_DELTA):
-        raise ValueError(f"encoding must be 'auto', 'none' or 'star-delta', got {encoding!r}")
     resolved_level = _check_codec(codec, level)
     cells_in_flight = workers if workers is not None else DEFAULT_CELLS_IN_FLIGHT
     if cells_in_flight < 1:
@@ -581,16 +451,21 @@ def encode(
     resolved_crs = crs if crs is not None else prepared.attrs.get("crs")
     if not resolved_crs:
         raise ValueError("no crs: pass crs='EPSG:xxxxx' or set da.attrs['crs']")
+    if schema._EPSG_RE.fullmatch(str(resolved_crs)) is None:
+        raise ValueError("only EPSG north-up grids are supported")
     base_transform = _resolve_transform(transform, prepared.da)
     times_iso, times_ms = _iso_times(prepared.times)
     if len(times_iso) != prepared.n_time:
         raise ValueError(f"{len(times_iso)} times for {prepared.n_time} timesteps")
-    resolved_bands = _resolve_bands(bands, prepared.band_coords, prepared.n_band)
-    resolved_nodata = _resolve_nodata(nodata, prepared.dtype, has_mask=prepared.mask is not None)
-    if encoding == schema.STAR_DELTA and prepared.dtype.name not in schema.TEMPORAL_DTYPES:
-        raise ValueError(
-            f"star-delta needs uint8 or uint16 data, got {prepared.dtype}; use encoding='none'"
+    resolved_bands = tuple(
+        replace(
+            b,
+            scale=1.0 if b.scale is None else b.scale,
+            offset=0.0 if b.offset is None else b.offset,
         )
+        for b in _resolve_bands(bands, prepared.band_coords, prepared.n_band)
+    )
+    resolved_nodata = _resolve_nodata(nodata, prepared.dtype, has_mask=prepared.mask is not None)
     resolved_provenance = None if provenance is None else schema.parse_provenance(provenance)
     if shard_time is not None and shard_time < 1:
         raise ValueError(f"shard_time must be at least 1, got {shard_time}")
@@ -615,7 +490,7 @@ def encode(
         has_coverage=prepared.coverage is not None,
         codec=codec,
         level=resolved_level,
-        anchor_interval=anchor_interval,
+        volatility=volatility,
     )
 
     out = Path(out)
@@ -648,7 +523,9 @@ def encode(
                 has_mask=layout.has_mask,
                 has_coverage=layout.has_coverage,
             )
-        return _encode(out, layout, source, encoding, cells_in_flight, resolved_provenance)
+        return _write_store(
+            out, layout, source, cells_in_flight=cells_in_flight, provenance=resolved_provenance
+        )
     except BaseException:
         shutil.rmtree(out, ignore_errors=True)
         if existed:
@@ -657,37 +534,3 @@ def encode(
     finally:
         if spill is not None:
             shutil.rmtree(spill, ignore_errors=True)
-
-
-def _encode(
-    out: Path,
-    layout: _Layout,
-    source: _Source,
-    encoding: str,
-    cells_in_flight: int,
-    provenance: dict | None,
-) -> EncodeReport:
-    anchors, reference = schema.compute_anchor_schedule(layout.n_time, layout.anchor_interval)
-    selection: Selection | None = None
-    if encoding == schema.STAR_DELTA:
-        star_delta = True
-    elif (
-        encoding == schema.NONE or layout.dtype.name not in schema.TEMPORAL_DTYPES or not reference
-    ):
-        star_delta = False  # auto with nothing to measure: no deltas, or dtype not eligible
-    else:
-        grid = schema.grid_shape(*layout.shapes[0], layout.chunk_size)
-        with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
-            selection = _measure_star_delta(
-                source, grid, anchors, reference, layout.codec, layout.level, pool
-            )
-        star_delta = selection.ratio <= AUTO_RATIO_LIMIT
-    return _write_store(
-        out,
-        layout,
-        source,
-        star_delta=star_delta,
-        selection=selection,
-        provenance=provenance,
-        cells_in_flight=cells_in_flight,
-    )

@@ -35,7 +35,7 @@ const test = base.extend({
   ],
 });
 
-const STORE = 'u16_stardelta';
+const STORE = 'u16_sharded';
 const PROJECTION = createProjection('EPSG:32631');
 const TRANSFORM = STORES[STORE].spec.transform;
 

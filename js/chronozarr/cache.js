@@ -101,7 +101,7 @@ export class ChunkCache {
    * Store a chunk's decoded array and/or compressed bytes, then evict down to budget. A `background` chunk
    * never displaces a better one: if it scores worse than everything it would evict, it loses its own copy instead.
    * @param {string} key
-   * @param {{lod:number,row:number,col:number,t:number,anchor:boolean}} meta
+   * @param {{lod:number,row:number,col:number,t:number}} meta
    * @param {{data?:ArrayBufferView|null, compressed?:Uint8Array|null}} parts
    */
   insert(key, meta, { data = null, compressed = null }, { background = false } = {}) {
@@ -185,14 +185,10 @@ export class ChunkCache {
     this.#compressedBytes = 0;
   }
 
-  /** Entries with decoded data, entries that are anchors among them, and the bytes of each tier. */
+  /** Entries with decoded data and the bytes of each tier. */
   info() {
-    let anchors = 0;
-    for (const key of this.#decodedKeys) if (this.#entries.get(key).anchor) anchors++;
     return {
       entries: this.#decodedKeys.size,
-      anchors,
-      deltas: this.#decodedKeys.size - anchors,
       bytes: this.#decodedBytes,
       compressedEntries: this.#compressedKeys.size,
       compressedBytes: this.#compressedBytes,

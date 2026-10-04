@@ -1,5 +1,7 @@
 # Matched level-0 rendering comparison
 
+Historical v0.2 results and artifacts below are preserved as recorded. They do not describe v0.3 writer options; use explicit conversion before reading the stores with v0.3.
+
 Run from the repository root with the existing bench dependencies and the three-date
 Lake Mead inputs prepared by `examples/bring_your_data/README.md`:
 

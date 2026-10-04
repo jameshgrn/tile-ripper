@@ -1,12 +1,11 @@
-"""Write real Ucayali LOD 0 chunks as Zarr v3 arrays with three codec chains, for the browser decode benchmark.
+"""Write real Ucayali chunks with three codec chains for the browser decode benchmark.
 
 Arrays (each shape (4, 4, 512, 512) uint16, chunks (1, 4, 512, 512), i.e. four 2 MB chunks):
   plain   bytes only (reference for bit-exactness)
   zstd5   bytes + zstd level 5 (chronozarr v0.1 default)
   blosc   bytes + blosc(cname=zstd, clevel=1, shuffle=byte shuffle, typesize 2)
 
-Chunks 0-2 are anchor timesteps of three different cells (true values); chunk 3 is a delta timestep
-(int16 residual against its anchor, stored as uint16 bits), as star-delta stores hold it.
+All four chunks contain true stored values from a v0.3 store.
 
 Run: uv run python js/support/codec-bench/make_stores.py [--source STORE] [--out DIR]
 """
@@ -21,24 +20,24 @@ import zarr
 from zarr.codecs import BloscCodec, BloscShuffle, ZstdCodec
 
 CS = 512
-ANCHOR_T = 60
+SAMPLE_T = 60
 CELLS = [(2, 2), (1, 3), (3, 1)]
-DELTA = (ANCHOR_T + 1, (2, 2))
+NEXT_SAMPLE = (SAMPLE_T + 1, (2, 2))
 
 
 def read_chunks(source: Path) -> np.ndarray:
     data = zarr.open_array(source / "0" / "data", mode="r")
     chunks = []
     for row, col in CELLS:
-        chunks.append(data[ANCHOR_T, :, row * CS : (row + 1) * CS, col * CS : (col + 1) * CS])
-    t, (row, col) = DELTA
+        chunks.append(data[SAMPLE_T, :, row * CS : (row + 1) * CS, col * CS : (col + 1) * CS])
+    t, (row, col) = NEXT_SAMPLE
     chunks.append(data[t, :, row * CS : (row + 1) * CS, col * CS : (col + 1) * CS])
     return np.stack(chunks).astype("<u2")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, default=Path("data/stores/ucayali_santa_maria/chronozarr-2"))
+    parser.add_argument("--source", type=Path, default=Path("data/stores/ucayali_santa_maria_v03"))
     parser.add_argument("--out", type=Path, default=Path("data/spike/codec_bench"))
     args = parser.parse_args()
 
@@ -65,10 +64,15 @@ def main() -> None:
             overwrite=True,
         )
         arr[:] = chunks
-        sizes[name] = [(args.out / name / "c" / str(i) / "0" / "0" / "0").stat().st_size for i in range(4)]
+        sizes[name] = [
+            (args.out / name / "c" / str(i) / "0" / "0" / "0").stat().st_size for i in range(4)
+        ]
     (args.out / "sizes.json").write_text(json.dumps(sizes, indent=1))
     print(json.dumps(sizes))
-    print("blosc zarr.json codecs:", json.dumps(json.loads((args.out / "blosc" / "zarr.json").read_text())["codecs"]))
+    print(
+        "blosc zarr.json codecs:",
+        json.dumps(json.loads((args.out / "blosc" / "zarr.json").read_text())["codecs"]),
+    )
 
 
 if __name__ == "__main__":

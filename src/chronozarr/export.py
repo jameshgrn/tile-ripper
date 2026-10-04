@@ -1,6 +1,6 @@
 """Export decoded timesteps of a store as Cloud Optimized GeoTIFFs for GDAL and QGIS.
 
-Each file holds every band of one timestep at one pyramid level, with star-delta encoding undone,
+Each file holds every band of one timestep at one pyramid level, with true stored values,
 so the values are the stored true values in the store's dtype (or, with `physical`, float32
 physical values). Validity, scale, offset, units and band names become GeoTIFF metadata that GDAL
 and QGIS read without chronozarr. `coverage` is not exported. Needs rasterio (`chronozarr[geo]`).

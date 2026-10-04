@@ -1,9 +1,6 @@
-// In-memory chronozarr store built in JS, independent of the Python writer (spec 0.1 shapes by default,
-// 0.2 features by option). Chunks are stored with the `bytes` codec only (no compression). Sharded (crc32c
-// index at "start" or "end", any shard_time) or unsharded; dtypes uint8, uint16, int16, float32; temporal
-// encoding star-delta (modular residuals) or none; optional mask and coverage variables, band objects, the
-// `levels` mirror, `shard_bytes` and consolidated metadata. Implements the zarrita AsyncReadable interface
-// and logs every call.
+import { CONVENTIONS } from '../chronozarr/metadata.js';
+// Independent in-memory v0.3 true-value fixture. Sharded or unsharded, with optional validity planes.
+// Implements zarrita AsyncReadable and logs every call. Bytes-only chunks isolate reader mechanics.
 
 const CRC32C_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -25,7 +22,7 @@ const json = (obj) => new TextEncoder().encode(JSON.stringify(obj));
 
 const ARRAYS = { uint8: Uint8Array, uint16: Uint16Array, int16: Int16Array, float32: Float32Array };
 
-/** Deterministic source value for (t, band, y, x): smooth in t so residuals stay small. */
+/** Deterministic source value for (t, band, y, x): smooth in t. */
 export function sourceValue(t, b, y, x) {
   return 1000 + b * 500 + ((y * 7 + x * 13) % 2000) + t * 37 + (x % 5 === 0 ? t * 3 : 0);
 }
@@ -46,13 +43,12 @@ export const coverageValue = (t, y, x, lod = 0) => (t * 3 + y + x * 2 + lod) % 7
 /**
  * @param {object} spec
  * @param {number} spec.nTime @param {number} spec.nBand @param {number} spec.height @param {number} spec.width
- * @param {number} spec.chunk @param {number} spec.anchorInterval @param {boolean} spec.sharded
+ * @param {number} spec.chunk @param {boolean} spec.sharded
  * @param {'start'|'end'} [spec.indexLocation]
  * @param {number} [spec.nLevels=1]        levels, each half the size of the previous (ceil)
  * @param {'uint8'|'uint16'|'int16'|'float32'} [spec.dtype='uint16']
- * @param {'star-delta'|'none'} [spec.encoding='star-delta']
  * @param {number} [spec.shardTime]        timesteps per shard (default nTime); several shards along time when smaller
- * @param {string} [spec.specVersion='0.1.0']
+ * @param {string} [spec.specVersion='0.3.0']
  * @param {string[]} [spec.bands]          band names (default B0, B1, ...)
  * @param {object[]} [spec.bandObjects]    band objects; writes `bands` as objects plus `band_names`
  * @param {number|null} [spec.nodata=0]
@@ -67,22 +63,14 @@ export const coverageValue = (t, y, x, lod = 0) => (t * 3 + y + x * 2 + lod) % 7
  * @param {number} [spec.delayMs]
  */
 export function buildSyntheticStore(spec) {
-  const { nTime, nBand, height, width, chunk, anchorInterval, sharded, indexLocation = 'end' } = spec;
+  const { nTime, nBand, height, width, chunk, sharded, indexLocation = 'end' } = spec;
   const dtype = spec.dtype ?? 'uint16';
   const Typed = ARRAYS[dtype];
-  const bits = Typed.BYTES_PER_ELEMENT * 8;
-  const encoding = spec.encoding ?? 'star-delta';
   const nLevels = spec.nLevels ?? 1;
   const shardTime = sharded ? (spec.shardTime ?? nTime) : 1;
   const values = spec.values ?? defaultValues(dtype);
   const nodata = spec.nodata === undefined ? 0 : spec.nodata;
   const bandNames = spec.bands ?? spec.bandObjects?.map((b) => b.name) ?? Array.from({ length: nBand }, (_, i) => `B${i}`);
-  const anchors = [];
-  const deltaReference = {};
-  for (let t = 0; t < nTime; t++) {
-    if (encoding === 'none' || t % anchorInterval === 0) anchors.push(t);
-    else deltaReference[t] = t - (t % anchorInterval);
-  }
   const files = new Map();
   const bytesCodec = { name: 'bytes', configuration: { endian: 'little' } };
   const auxBytesCodec = { name: 'bytes' };
@@ -113,13 +101,14 @@ export function buildSyntheticStore(spec) {
         ? [{ name: 'sharding_indexed', configuration: { chunk_shape: inner, codecs, index_codecs: indexCodecs(), index_location: indexLocation } }]
         : codecs,
       dimension_names: dims,
-      attributes: {},
+      attributes: { _ARRAY_DIMENSIONS: dims, zarr_conventions: [CONVENTIONS.proj, CONVENTIONS.spatial],
+        'proj:code': 'EPSG:32631', 'spatial:dimensions': ['y', 'x'], 'spatial:registration': 'pixel',
+        'spatial:transform': groupAttrs(level).transform },
     };
   };
 
   const dataChunk = (level, t, row, col) => {
-    const out = new Typed(nBand * chunk * chunk);
-    const anchorT = t in deltaReference ? deltaReference[t] : t;
+    const out = new Typed(nBand * chunk * chunk).fill(nodata ?? 0);
     for (let b = 0; b < nBand; b++) {
       for (let y = 0; y < chunk; y++) {
         for (let x = 0; x < chunk; x++) {
@@ -127,8 +116,7 @@ export function buildSyntheticStore(spec) {
           const gx = col * chunk + x;
           if (gy >= level.height || gx >= level.width) continue;
           const value = values(t, b, gy, gx, level.lod);
-          // Typed-array assignment wraps, which is the modular residual.
-          out[(b * chunk + y) * chunk + x] = anchorT === t ? value : value - values(anchorT, b, gy, gx, level.lod);
+          out[(b * chunk + y) * chunk + x] = value;
         }
       }
     }
@@ -199,14 +187,10 @@ export function buildSyntheticStore(spec) {
     }
   };
 
-  const groupAttrs = (level) =>
-    spec.transform
-      ? {
-          crs: 'EPSG:32631',
-          transform: [spec.transform[0] * 2 ** level.lod, spec.transform[1], spec.transform[2], spec.transform[3], spec.transform[4] * 2 ** level.lod, spec.transform[5]],
-          resolution: Math.abs(spec.transform[0]) * 2 ** level.lod,
-        }
-      : {};
+  const transform = spec.transform ?? [10, 0, 0, 0, -10, 0];
+  const groupAttrs = (level) => ({ crs: 'EPSG:32631',
+    transform: [transform[0] * 2 ** level.lod, transform[1], transform[2], transform[3], transform[4] * 2 ** level.lod, transform[5]],
+    resolution: transform[0] * 2 ** level.lod });
   for (const level of levels) {
     writeArray(level, 'data', 'data', (l, t, row, col) => dataChunk(l, t, row, col));
     if (spec.mask) writeArray(level, 'aux', 'mask', (l, t, row, col) => auxChunk(l, t, row, col, maskValue));
@@ -214,16 +198,15 @@ export function buildSyntheticStore(spec) {
     files.set(`/${level.lod}/zarr.json`, json({ zarr_format: 3, node_type: 'group', attributes: groupAttrs(level) }));
   }
 
-  const specVersion = spec.specVersion ?? '0.1.0';
+  const specVersion = spec.specVersion ?? '0.3.0';
   const chronozarr = {
     spec_version: specVersion,
     variable: 'data',
-    times: Array.from({ length: nTime }, (_, t) => `2024-01-${String(t + 1).padStart(2, '0')}T00:00:00Z`),
-    bands: spec.bandObjects ?? bandNames,
-    ...(spec.bandObjects ? { band_names: bandNames } : {}),
+    times: Array.from({ length: nTime }, (_, t) => new Date(Date.UTC(2024, 0, 1 + t)).toISOString().replace('.000Z', 'Z')),
+    bands: spec.bandObjects ?? bandNames.map((name) => ({ name, scale: 1e-4, offset: 0 })),
+    band_names: bandNames,
     nodata,
     crs: 'EPSG:32631',
-    temporal: encoding === 'none' ? { encoding: 'none' } : { encoding: 'star-delta', anchor_interval: anchorInterval, anchor_indices: anchors, delta_reference: deltaReference },
     ...(spec.mask ? { mask_variable: 'mask' } : {}),
     ...(spec.coverage ? { coverage_variable: 'coverage' } : {}),
     ...(spec.provenance ? { provenance: spec.provenance } : {}),
@@ -231,7 +214,7 @@ export function buildSyntheticStore(spec) {
       ? {
           levels: levels.map((l) => ({
             path: String(l.lod),
-            resolution: spec.transform ? Math.abs(spec.transform[0]) * 2 ** l.lod : 10 * 2 ** l.lod,
+            resolution: groupAttrs(l).resolution,
             transform: groupAttrs(l).transform ?? [10 * 2 ** l.lod, 0, 0, 0, -10 * 2 ** l.lod, 0],
             shape: [nTime, nBand, l.height, l.width],
             grid: [l.rows, l.cols],
@@ -244,7 +227,8 @@ export function buildSyntheticStore(spec) {
     zarr_format: 3,
     node_type: 'group',
     attributes: {
-      multiscales: [{ datasets: levels.map((l) => ({ path: String(l.lod), pixels_per_tile: chunk, crs: 'EPSG:32631' })), type: 'reduce' }],
+      zarr_conventions: [{ name: 'chronozarr', spec_url: 'https://github.com/chronozarr/chronozarr/blob/main/spec/CHRONOZARR.md' }, CONVENTIONS.multiscales],
+      multiscales: { layout: levels.map((l) => ({ asset: String(l.lod), ...(l.lod ? { derived_from: String(l.lod - 1), transform: { scale: [2, 2], translation: [0, 0] } } : {}) })), resampling_method: 'average' },
       chronozarr,
     },
   };

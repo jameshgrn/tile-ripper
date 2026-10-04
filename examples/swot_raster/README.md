@@ -1,5 +1,7 @@
 # Local SWOT raster fidelity demo
 
+chronozarr v0.3 is a raster time-series profile built on Zarr v3 and zarr-conventions multiscales, proj and spatial v0.1. Every data array contains true stored values; physical units use per-band scale and offset. Volatility is optional. v0.3 readers require explicit migration of v0.2 stores: `chronozarr convert OLD_STORE NEW_STORE`.
+
 `demo.ipynb` opens a small store in the notebook player and in leafmap MapLibre.
 The source is two existing official SWOT L2 HR Raster 100 m NetCDF files over the
 Roanoke region, dated 2025-11-14 and 2026-07-12. No download or cloud upload is

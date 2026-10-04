@@ -4,7 +4,7 @@ import { getEventListeners } from 'node:events';
 import { openStore } from '../chronozarr/decoder.js';
 import { buildSyntheticStore } from '../support/synthetic-store.js';
 
-const spec = { nTime: 12, nBand: 1, height: 32, width: 32, chunk: 32, anchorInterval: 4, sharded: true, mask: true, coverage: true };
+const spec = { nTime: 12, nBand: 1, height: 32, width: 32, chunk: 32,  sharded: true, mask: true, coverage: true };
 
 test('close releases data, compressed bytes and auxiliary arrays even when the store remains referenced', async () => {
   const readable = buildSyntheticStore(spec);

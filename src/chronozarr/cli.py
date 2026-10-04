@@ -143,18 +143,7 @@ def _encode_options(command: Any) -> Any:
             help="Spatial chunk edge in pixels (256 or 512 per the spec).",
         ),
         click.option(
-            "--anchor-interval",
-            type=int,
-            default=6,
-            show_default=True,
-            help="Timesteps between anchors (star-delta only).",
-        ),
-        click.option(
-            "--encoding",
-            type=click.Choice(["auto", "none", "star-delta"]),
-            default="auto",
-            show_default=True,
-            help="Temporal encoding; auto keeps star-delta only when it saves at least 15%.",
+            "--volatility", is_flag=True, help="Write the optional cell volatility metric."
         ),
         click.option(
             "--codec",
@@ -203,8 +192,7 @@ def _encode_kwargs(options: dict[str, Any]) -> dict[str, Any]:
         raise click.UsageError("--shard-time needs --shard")
     return {
         "chunk_size": options["chunk_size"],
-        "anchor_interval": options["anchor_interval"],
-        "encoding": options["encoding"],
+        "volatility": options["volatility"],
         "codec": options["codec"],
         "level": options["compression_level"],
         "shard": options["shard"],
@@ -215,15 +203,9 @@ def _encode_kwargs(options: dict[str, Any]) -> dict[str, Any]:
 
 
 def _encode_summary(out: Path, report: EncodeReport) -> str:
-    encoding = report.encoding
-    if report.selection is not None:
-        encoding += (
-            f" (auto: star-delta/plain = {report.selection.ratio:.2f} "
-            f"on {report.selection.sampled_cells} cells)"
-        )
     return (
         f"wrote {out}: {len(report.levels)} levels, {report.n_files} files, "
-        f"{report.total_bytes / 1e6:.1f} MB, encoding {encoding}, "
+        f"{report.total_bytes / 1e6:.1f} MB, "
         f"{report.codec} level {report.level}"
     )
 
@@ -231,7 +213,7 @@ def _encode_summary(out: Path, report: EncodeReport) -> str:
 @click.group()
 @click.version_option(package_name="chronozarr")
 def main() -> None:
-    """Zarr v3 stores for raster time series with star-delta temporal encoding."""
+    """Zarr v3 stores for raster time series with true stored values."""
 
 
 @main.command("encode")
@@ -315,30 +297,16 @@ def validate_command(store: str) -> None:
 @main.command("info")
 @click.argument("store")
 def info_command(store: str) -> None:
-    """Summarise STORE: times, bands, temporal encoding and pyramid levels."""
+    """Summarise STORE: times, bands and pyramid levels."""
     with _command_errors():
         opened = open_store(store)
     attrs = opened.attrs
-    temporal = attrs.temporal
     click.echo(f"store:     {store}")
     click.echo(f"version:   chronozarr {attrs.spec_version}")
     click.echo(f"crs:       {attrs.crs}")
     click.echo(f"times:     {len(opened.times)} ({attrs.times[0]} .. {attrs.times[-1]})")
     click.echo(f"bands:     {', '.join(opened.bands)}")
     click.echo(f"nodata:    {attrs.nodata}")
-    if temporal.encoding == schema.STAR_DELTA:
-        described = (
-            f"{schema.STAR_DELTA} every {temporal.anchor_interval}: "
-            f"{len(temporal.anchor_indices)} anchors, {len(temporal.delta_reference)} deltas"
-        )
-    else:
-        described = f"{temporal.encoding} (every timestep stored as true values)"
-    if temporal.selection is not None:
-        described += (
-            f"; auto chose it at star-delta/plain = {temporal.selection.ratio:.2f} "
-            f"on {temporal.selection.sampled_cells} cells"
-        )
-    click.echo(f"temporal:  {described}")
     extras = [
         name
         for name, present in (
@@ -617,8 +585,11 @@ def convert_command(
     cell by cell. The size and time estimate is printed first; --dry-run stops there.
     """
     last_report = 0.0
+    migration = False
 
     def show_plan(plan: Plan) -> None:
+        nonlocal migration
+        migration = plan.source.kind == "chronozarr v0.2"
         for line in plan.lines(read_ahead):
             click.echo(line)
 
@@ -627,7 +598,8 @@ def convert_command(
         now = time.monotonic()
         if done == total or now - last_report >= 2.0:
             last_report = now
-            click.echo(f"staged {done}/{total} timesteps", err=True)
+            label = "verified level/timestep pairs" if migration else "staged timesteps"
+            click.echo(f"{label}: {done}/{total}", err=True)
 
     with _command_errors():
         report = convert(
@@ -654,6 +626,12 @@ def convert_command(
         click.echo("dry run: nothing was written")
         return
     click.echo(_encode_summary(out, report.encode))
+    if migration:
+        click.echo(
+            f"verified every value in {len(report.encode.levels)} levels, "
+            f"{report.plan.n_time} timesteps; total {report.total_s:.1f} s"
+        )
+        return
     click.echo(
         f"read {report.n_staged} timesteps ({report.n_reused} reused) in {report.read_s:.1f} s, "
         f"encoded in {report.encode_s:.1f} s, total {report.total_s:.1f} s"

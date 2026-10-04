@@ -1,7 +1,7 @@
 [project]
 name = "chronozarr"
-version = "0.2.1"
-description = "Zarr v3 convention and reader for raster time series with optional star-delta temporal encoding"
+version = "0.3.0"
+description = "Zarr v3 convention and reader for raster time series with true stored values"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

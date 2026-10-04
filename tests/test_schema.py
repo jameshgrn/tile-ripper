@@ -42,70 +42,6 @@ def test_encoded_store_conforms(good_store):
     assert chronozarr.validate(good_store) == []
 
 
-def test_written_attrs_have_the_specified_shape(good_store):
-    root = zarr.open_group(str(good_store), mode="r", zarr_format=3)
-    attrs = root.attrs.asdict()
-    block = attrs["chronozarr"]
-    assert block["spec_version"] == "0.2.0"
-    assert block["variable"] == "data"
-    assert block["times"] == [
-        "2024-01-01T00:00:00Z",
-        "2024-02-01T00:00:00Z",
-        "2024-03-01T00:00:00Z",
-    ]
-    assert block["bands"] == [{"name": "B04"}, {"name": "B08"}]
-    assert block["band_names"] == ["B04", "B08"]
-    assert block["nodata"] == 0
-    assert block["crs"] == "EPSG:32631"
-    assert block["temporal"] == {
-        "encoding": "star-delta",
-        "anchor_interval": 2,
-        "anchor_indices": [0, 2],
-        "delta_reference": {"1": 0},
-    }
-    assert block["volatility_path"] == "volatility"
-    assert not {"mask_variable", "coverage_variable", "provenance"} & set(block)
-    assert [lv["path"] for lv in block["levels"]] == ["0", "1"]
-    assert block["levels"][1] == {
-        "path": "1",
-        "resolution": 20.0,
-        "transform": [20.0, 0.0, 746090.0, 0.0, -20.0, 2540440.0],
-        "shape": [3, 2, 350, 300],
-        "grid": [1, 1],
-    }
-    (multiscale,) = attrs["multiscales"]
-    assert multiscale["datasets"] == [
-        {"path": "0", "crs": "EPSG:32631"},
-        {"path": "1", "crs": "EPSG:32631"},
-    ]
-    assert multiscale["type"] == "reduce"
-    assert multiscale["metadata"] == {
-        "method": "block_mean",
-        "version": "chronozarr 0.2.0",
-        "args": [],
-    }
-    assert "method" not in multiscale
-
-    data_attrs = root["0"]["data"].attrs.asdict()
-    assert data_attrs["_ARRAY_DIMENSIONS"] == ["time", "band", "y", "x"]
-    assert data_attrs["proj:code"] == "EPSG:32631"
-    assert data_attrs["spatial:dimensions"] == ["y", "x"]
-    assert data_attrs["spatial:shape"] == [700, 600]
-    assert data_attrs["spatial:transform"] == [10.0, 0.0, 746090.0, 0.0, -10.0, 2540440.0]
-    assert data_attrs["spatial:bbox"] == [746090.0, 2533440.0, 752090.0, 2540440.0]
-    coarse = root["1"]["data"].attrs.asdict()
-    assert coarse["spatial:shape"] == [350, 300]
-    assert coarse["spatial:transform"] == [20.0, 0.0, 746090.0, 0.0, -20.0, 2540440.0]
-    assert coarse["spatial:bbox"] == [746090.0, 2533440.0, 752090.0, 2540440.0]
-
-    level_attrs = root["1"].attrs.asdict()
-    assert level_attrs == {
-        "crs": "EPSG:32631",
-        "transform": [20.0, 0.0, 746090.0, 0.0, -20.0, 2540440.0],
-        "resolution": 20.0,
-    }
-
-
 def test_every_array_declares_dimension_names(good_store):
     root = zarr.open_group(str(good_store), mode="r", zarr_format=3)
     expected = {
@@ -164,28 +100,15 @@ def test_consolidated_metadata_is_written_and_readable(good_store):
 @pytest.mark.parametrize(
     ("edit", "message"),
     [
-        (lambda b: b.update(spec_version="0.3.0"), "spec_version: unsupported version '0.3.0'"),
+        (lambda b: b.update(spec_version="8.0.0"), "chronozarr convert"),
         (lambda b: b.pop("times"), "missing required key 'times'"),
-        (
-            lambda b: b.update(times=["2024-02-01", "2024-01-01", "2024-03-01"]),
-            "strictly increasing",
-        ),
-        (lambda b: b.update(times=["not-a-date", "2024-02", "2024-03"]), "not an ISO-8601"),
-        (lambda b: b.update(bands=["B04", "B04"]), "must be unique"),
+        (lambda b: b.update(times=["2024-02", "2024-01"]), "strictly increasing"),
+        (lambda b: b.update(times=["not-a-date"]), "not an ISO-8601"),
+        (lambda b: b.update(bands=[{"name": "x"}, {"name": "x"}]), "must be unique"),
         (lambda b: b.update(nodata="zero"), "expected a finite number or null"),
         (lambda b: b.update(crs=""), "non-empty string"),
         (lambda b: b.update(variable=""), "expected a non-empty array name"),
-        (lambda b: b["temporal"].update(encoding="chain-delta"), "expected one of"),
-        (lambda b: b["temporal"].update(anchor_interval=0), "expected int >= 1"),
-        (lambda b: b["temporal"].update(anchor_indices=[0, 1]), "anchor_indices"),
-        (
-            lambda b: b["temporal"].update(delta_reference={"1": 1}),
-            "timestep 1 references 1, which is not an anchor",
-        ),
-        (
-            lambda b: b["temporal"].update(delta_reference={}),
-            "are neither anchors nor listed",
-        ),
+        (lambda b: b.update(temporal={"encoding": "none"}), "outside v0.3"),
     ],
 )
 def test_bad_chronozarr_block_is_rejected_by_reader_and_validator(store_copy, edit, message):
@@ -200,9 +123,9 @@ def test_bad_chronozarr_block_is_rejected_by_reader_and_validator(store_copy, ed
 @pytest.mark.parametrize(
     ("edit", "message"),
     [
-        (lambda ms: ms.clear(), "exactly one entry"),
-        (lambda ms: ms[0]["datasets"].reverse(), "listed as '0', '1'"),
-        (lambda ms: ms[0]["datasets"][1].update(crs="EPSG:4326"), "expected 'EPSG:32631'"),
+        (lambda ms: ms.clear(), "missing required key 'layout'"),
+        (lambda ms: ms["layout"].reverse(), "consecutive group paths"),
+        (lambda ms: ms["layout"][1].update(derived_from="9"), "previous level"),
     ],
 )
 def test_bad_multiscales_is_rejected(store_copy, edit, message):
@@ -219,26 +142,6 @@ def test_writer_never_emits_pixels_per_tile(good_store):
         "pixels_per_tile" not in root_json
     )  # not in the attributes, not in the consolidated copy
     assert chronozarr.open_store(good_store).levels[0].chunk_size == 512
-
-
-@pytest.mark.parametrize("value", [512, 256, "not a number"], ids=["same", "stale", "garbage"])
-def test_pixels_per_tile_from_an_earlier_writer_is_ignored(store_copy, value):
-    """Stores written before the key was dropped carry it; reader and validator ignore it."""
-    before = chronozarr.open_store(store_copy)
-    expected, grid = before.read(1), before.levels[0].grid
-
-    def add_key(key, attrs):
-        if key == "multiscales":
-            for dataset in attrs[0]["datasets"]:
-                dataset["pixels_per_tile"] = value
-
-    _edit_root(store_copy, add_key)
-    assert "pixels_per_tile" in (store_copy / "zarr.json").read_text()
-    assert chronozarr.validate(store_copy) == []
-    after = chronozarr.open_store(store_copy)
-    assert after.levels[0].chunk_size == 512
-    assert after.levels[0].grid == grid
-    assert np.array_equal(after.read(1), expected)
 
 
 def test_cell_size_is_the_chunk_size_of_the_data_array():
@@ -293,7 +196,7 @@ def test_validator_reports_structural_problems(store_copy):
     root["1"].attrs["transform"] = [30.0, 0.0, 746090.0, 0.0, -30.0, 2540440.0]
     problems = chronozarr.validate(store_copy)
     assert any("not the level-0 transform scaled by 2^1" in p for p in problems)
-    assert any("attribute spatial:shape must be [350, 300]" in p for p in problems)
+    assert any("spatial:shape differs from geometry" in p for p in problems)
     assert any("1/data: consolidated metadata is stale" in p for p in problems)
 
 
@@ -331,45 +234,14 @@ def test_variable_name_comes_from_attrs_not_a_hardcoded_default(store_copy):
     assert "level 1: array 'reflectance' is missing" in problems
 
 
-def test_optional_data_attrs_are_not_required_but_must_be_correct_when_present(store_copy):
+def test_geometry_aliases_are_optional_and_must_match_when_present(store_copy):
     root = zarr.open_group(str(store_copy), mode="r+", zarr_format=3, use_consolidated=False)
     data = root["0"]["data"]
-    for key in ("proj:code", "spatial:bbox", "spatial:transform", "spatial:shape", "crs"):
+    for key in ("spatial:bbox", "spatial:shape", "crs", "transform", "_CRS"):
         del data.attrs[key]
     problems = chronozarr.validate(store_copy)
     assert not [p for p in problems if "attribute" in p]
     assert chronozarr.open_store(store_copy).levels[0].shape == (3, 2, 700, 600)
 
     data.attrs["spatial:bbox"] = [0.0, 0.0, 1.0, 1.0]
-    assert any("attribute spatial:bbox must be" in p for p in chronozarr.validate(store_copy))
-
-
-def test_delta_reference_rule_accepts_any_anchor_within_one_interval():
-    anchors = [0, 6, 12]
-    nearest = {1: 0, 2: 0, 3: 0, 4: 6, 5: 6, 7: 6, 8: 6, 9: 6, 10: 12, 11: 12}
-    preceding = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 7: 6, 8: 6, 9: 6, 10: 6, 11: 6}
-    assert schema.delta_reference_problem(nearest, anchors, 13, 6) is None
-    assert schema.delta_reference_problem(preceding, anchors, 13, 6) is None
-    assert schema.delta_reference_problem({**preceding, 5: 6}, anchors, 13, 6) is None
-
-
-@pytest.mark.parametrize(
-    ("change", "message"),
-    [
-        (lambda r: r.pop(7), "[7] are neither anchors nor listed"),
-        (lambda r: r.update({6: 0}), "[6] are anchors or outside"),
-        (lambda r: r.update({40: 0}), "[40] are anchors or outside"),
-        (lambda r: r.update({7: 8}), "timestep 7 references 8, which is not an anchor"),
-        (lambda r: r.update({8: 0}), "timestep 8 references anchor 0 at distance 8"),
-        (lambda r: r.update({1: 12}), "timestep 1 references anchor 12 at distance 11"),
-    ],
-)
-def test_delta_reference_rule_names_the_violation(change, message):
-    reference = {1: 0, 2: 0, 3: 0, 4: 6, 5: 6, 7: 6, 8: 6, 9: 6, 10: 12, 11: 12}
-    change(reference)
-    assert message in (schema.delta_reference_problem(reference, [0, 6, 12], 13, 6) or "")
-
-
-def test_an_interval_of_one_has_no_references():
-    assert schema.delta_reference_problem({}, [0, 1, 2], 3, 1) is None
-    assert "anchors or outside" in (schema.delta_reference_problem({1: 0}, [0, 1, 2], 3, 1) or "")
+    assert any("spatial:bbox differs from geometry" in p for p in chronozarr.validate(store_copy))

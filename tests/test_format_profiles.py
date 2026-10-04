@@ -19,7 +19,6 @@ CS = 8  # tiny cells keep the tests fast; 2 x 2 cells of a 13 x 11 raster
 
 def _encode(tmp_path, truth, **kwargs):
     kwargs.setdefault("chunk_size", CS)
-    kwargs.setdefault("anchor_interval", 2)
     bands = kwargs.pop("bands", [f"b{i}" for i in range(truth.shape[1])])
     names = [b if isinstance(b, str) else getattr(b, "name", None) or b["name"] for b in bands]
     da = make_da(truth, names)
@@ -39,47 +38,6 @@ def _scene(dtype: str, seed: int = 3) -> np.ndarray:
 # --- dtype profiles ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", ["uint8", "uint16", "int16", "float32"])
-@pytest.mark.parametrize("shard", [True, False], ids=["sharded", "unsharded"])
-def test_every_dtype_roundtrips_with_a_correct_pyramid(tmp_path, dtype, shard):
-    truth = _scene(dtype)
-    nodata = -9999.0 if dtype == "float32" else None
-    truth[0, 0, 0, 0] = nodata if nodata is not None else truth[0, 0, 0, 0]
-    report, store = _encode(tmp_path, truth, encoding="none", shard=shard, nodata=nodata)
-    assert store.dtype == np.dtype(dtype)
-    assert store.attrs.nodata == nodata
-    level = truth
-    for lod in range(len(store.levels)):
-        if lod:
-            level, _, _ = reference_reduce(level, nodata=nodata)
-        assert np.array_equal(store.to_xarray(lod=lod).values, level), f"{dtype} level {lod}"
-    assert chronozarr.validate(tmp_path / "s") == []
-    raw = zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"]
-    assert raw.dtype == np.dtype(dtype)
-    assert report.encoding == "none"
-
-
-@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
-def test_unsigned_dtypes_support_star_delta(tmp_path, dtype):
-    truth = _scene(dtype)
-    _, store = _encode(tmp_path, truth, encoding="star-delta", nodata=0)
-    assert store.attrs.temporal.encoding == "star-delta"
-    assert np.array_equal(store.to_xarray().values, truth)
-    assert zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"].dtype == np.dtype(dtype)
-
-
-@pytest.mark.parametrize("dtype", ["int16", "float32"])
-def test_signed_and_float_dtypes_are_none_only(tmp_path, dtype):
-    with pytest.raises(ValueError, match="star-delta needs uint8 or uint16 data"):
-        chronozarr.encode(
-            make_da(_scene(dtype)), tmp_path / "s", chunk_size=CS, encoding="star-delta"
-        )
-    assert not (tmp_path / "s").exists()
-    report, _ = _encode(tmp_path, _scene(dtype), encoding="auto")
-    assert report.encoding == "none"
-    assert report.selection is None
-
-
 def test_unsupported_dtype_is_rejected(tmp_path):
     truth = make_truth(2, 1, 8, 8).astype(np.int32)
     with pytest.raises(ValueError, match="unsupported dtype int32"):
@@ -90,11 +48,11 @@ def test_unsupported_dtype_is_rejected(tmp_path):
 
 
 def test_default_nodata_is_zero_for_unsigned_and_null_otherwise(tmp_path):
-    _, unsigned = _encode(tmp_path, _scene("uint16"), encoding="none")
+    _, unsigned = _encode(tmp_path, _scene("uint16"))
     assert unsigned.attrs.nodata == 0
     other = tmp_path / "other"
     other.mkdir()
-    _, signed = _encode(other, _scene("int16"), encoding="none")
+    _, signed = _encode(other, _scene("int16"))
     assert signed.attrs.nodata is None
 
 
@@ -102,7 +60,7 @@ def test_explicit_nodata_is_fill_value_attr_and_excluded_from_means(tmp_path):
     truth = np.full((2, 1, 4, 4), 100, dtype=np.uint16)
     truth[:, :, 0, 0] = 65535
     truth[:, :, 2:, 2:] = 65535  # a fully nodata block
-    _, store = _encode(tmp_path, truth, chunk_size=4, encoding="none", nodata=65535, n_lods=2)
+    _, store = _encode(tmp_path, truth, chunk_size=4, nodata=65535, n_lods=2)
     data = zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"]
     assert data.fill_value == 65535
     assert data.attrs["nodata"] == 65535
@@ -115,7 +73,7 @@ def test_explicit_nodata_is_fill_value_attr_and_excluded_from_means(tmp_path):
 def test_nodata_null_treats_zero_as_a_value(tmp_path):
     truth = np.zeros((1, 1, 2, 2), dtype=np.uint16)
     truth[0, 0, 0, 0] = 8
-    _, store = _encode(tmp_path, truth, chunk_size=2, encoding="none", nodata=None, n_lods=2)
+    _, store = _encode(tmp_path, truth, chunk_size=2, nodata=None, n_lods=2)
     assert store.read(0, lod=1)[0, 0, 0] == 2  # (8 + 0 + 0 + 0) // 4: zeros count
     assert zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"].fill_value == 0
 
@@ -123,7 +81,7 @@ def test_nodata_null_treats_zero_as_a_value(tmp_path):
 def test_star_delta_with_a_nonzero_nodata_roundtrips(tmp_path):
     truth = make_truth(4, 1, 13, 11)
     truth[:, :, 0, :] = 65535
-    _, store = _encode(tmp_path, truth, encoding="star-delta", nodata=65535)
+    _, store = _encode(tmp_path, truth, nodata=65535)
     assert np.array_equal(store.to_xarray().values, truth)
     assert chronozarr.validate(tmp_path / "s") == []
 
@@ -141,9 +99,7 @@ def test_star_delta_with_a_nonzero_nodata_roundtrips(tmp_path):
 )
 def test_invalid_nodata_is_rejected(tmp_path, dtype, nodata, message):
     with pytest.raises(ValueError, match=message):
-        chronozarr.encode(
-            make_da(_scene(dtype)), tmp_path / "s", chunk_size=CS, nodata=nodata, encoding="none"
-        )
+        chronozarr.encode(make_da(_scene(dtype)), tmp_path / "s", chunk_size=CS, nodata=nodata)
 
 
 # --- physical values --------------------------------------------------------------------------
@@ -155,7 +111,7 @@ def test_physical_applies_scale_offset_and_nan_for_nodata(tmp_path):
         {"name": "B04", "common_name": "red", "scale": 0.0001},
         {"name": "T", "scale": 0.5, "offset": -10.0, "units": "K"},
     ]
-    _, store = _encode(tmp_path, truth, chunk_size=2, bands=bands, encoding="none", n_lods=1)
+    _, store = _encode(tmp_path, truth, chunk_size=2, bands=bands, n_lods=1)
     physical = store.physical(0)
     assert physical.dtype == np.float32
     assert np.isnan(physical[0, 0, 0])  # stored 0 is nodata
@@ -171,7 +127,7 @@ def test_physical_applies_scale_offset_and_nan_for_nodata(tmp_path):
 def test_physical_uses_the_mask_over_nodata(tmp_path):
     truth = np.array([[[[0, 7]]]], dtype=np.uint16)
     mask = np.array([[[1, 0]]], dtype=np.uint8)  # pixel 0 valid despite value 0; pixel 1 invalid
-    _, store = _encode(tmp_path, truth, chunk_size=2, mask=mask, encoding="none", n_lods=1)
+    _, store = _encode(tmp_path, truth, chunk_size=2, mask=mask, n_lods=1)
     physical = store.physical(0)
     assert physical[0, 0, 0] == 0.0
     assert np.isnan(physical[0, 0, 1])
@@ -179,7 +135,7 @@ def test_physical_uses_the_mask_over_nodata(tmp_path):
 
 def test_physical_defaults_to_identity_scale(tmp_path):
     truth = _scene("int16")
-    _, store = _encode(tmp_path, truth, encoding="none")
+    _, store = _encode(tmp_path, truth)
     assert np.array_equal(store.physical(1, lod=0), truth[1].astype(np.float32))
 
 
@@ -198,7 +154,7 @@ def _masked_scene():
 @pytest.mark.parametrize("shard", [True, False], ids=["sharded", "unsharded"])
 def test_mask_is_stored_reduced_and_drives_the_data_means(tmp_path, shard):
     truth, mask = _masked_scene()
-    _, store = _encode(tmp_path, truth, mask=mask, shard=shard, encoding="star-delta")
+    _, store = _encode(tmp_path, truth, mask=mask, shard=shard)
     assert store.attrs.mask_variable == "mask"
     level, level_mask = truth, mask
     for lod in range(len(store.levels)):
@@ -250,7 +206,7 @@ def test_bad_mask_is_rejected(tmp_path, mutate, message):
 
 def test_bool_mask_is_accepted(tmp_path):
     truth, mask = _masked_scene()
-    _, store = _encode(tmp_path, truth, mask=mask.astype(bool), encoding="none")
+    _, store = _encode(tmp_path, truth, mask=mask.astype(bool))
     assert np.array_equal(store.read_mask(1), mask[1])
 
 
@@ -262,7 +218,7 @@ def test_bands_are_objects_with_a_names_mirror(tmp_path):
         Band("B04", common_name="red", scale=0.0001, offset=0.0, units="reflectance"),
         Band("B08", common_name="nir"),
     ]
-    _, store = _encode(tmp_path, make_truth(2, 2, 13, 11), bands=bands, encoding="none")
+    _, store = _encode(tmp_path, make_truth(2, 2, 13, 11), bands=bands)
     block = zarr.open_group(str(tmp_path / "s"), mode="r").attrs["chronozarr"]
     assert block["bands"] == [
         {
@@ -272,11 +228,11 @@ def test_bands_are_objects_with_a_names_mirror(tmp_path):
             "offset": 0.0,
             "units": "reflectance",
         },
-        {"name": "B08", "common_name": "nir"},
+        {"name": "B08", "common_name": "nir", "scale": 1.0, "offset": 0.0},
     ]
     assert block["band_names"] == ["B04", "B08"]
     assert store.bands == ("B04", "B08")
-    assert store.attrs.bands == tuple(bands)
+    assert store.attrs.bands == (bands[0], Band("B08", common_name="nir", scale=1.0, offset=0.0))
     assert list(zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["band"][:]) == ["B04", "B08"]
 
 
@@ -303,7 +259,7 @@ def test_bad_bands_are_rejected(tmp_path, bands, message):
 
 
 def test_band_mismatch_between_attrs_and_band_names_is_flagged(tmp_path):
-    _encode(tmp_path, make_truth(2, 2, 13, 11), encoding="none")
+    _encode(tmp_path, make_truth(2, 2, 13, 11))
     root = zarr.open_group(str(tmp_path / "s"), mode="r+", use_consolidated=False)
     block = dict(root.attrs["chronozarr"])
     block["band_names"] = ["wrong", "names"]
@@ -345,10 +301,10 @@ def _zeros_that_are_valid():
 
 def test_a_mask_makes_the_default_nodata_null(tmp_path):
     truth, mask = _zeros_that_are_valid()
-    _, store = _encode(tmp_path, truth, mask=mask, encoding="none")
+    _, store = _encode(tmp_path, truth, mask=mask)
     assert store.attrs.nodata is None
     data = zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"]
-    assert data.attrs["nodata"] is None
+    assert "nodata" not in data.attrs
     assert data.fill_value == 0
     assert chronozarr.validate(tmp_path / "s") == []
     physical = store.physical(0)
@@ -370,14 +326,13 @@ def test_a_mask_with_iterable_input_also_defaults_nodata_to_null(tmp_path):
         transform=TRANSFORM,
         mask=iter(mask),
         chunk_size=CS,
-        encoding="none",
     )
     assert chronozarr.open_store(tmp_path / "s").attrs.nodata is None
 
 
 def test_an_explicit_nodata_is_kept_with_a_mask(tmp_path):
     truth, mask = _zeros_that_are_valid()
-    _, store = _encode(tmp_path, truth, mask=mask, encoding="none", nodata=0)
+    _, store = _encode(tmp_path, truth, mask=mask, nodata=0)
     assert store.attrs.nodata == 0
     assert zarr.open_group(str(tmp_path / "s"), mode="r")["0"]["data"].attrs["nodata"] == 0
     assert chronozarr.validate(tmp_path / "s") == []
@@ -385,13 +340,13 @@ def test_an_explicit_nodata_is_kept_with_a_mask(tmp_path):
 
 def test_without_a_mask_the_default_nodata_is_still_zero(tmp_path):
     truth, _ = _zeros_that_are_valid()
-    _, store = _encode(tmp_path, truth, encoding="none")
+    _, store = _encode(tmp_path, truth)
     assert store.attrs.nodata == 0
 
 
 def test_to_xarray_carries_validity_as_a_mask_coordinate_not_a_nodata_attr(tmp_path):
     truth, mask = _zeros_that_are_valid()
-    _, store = _encode(tmp_path, truth, mask=mask, encoding="none", nodata=0)
+    _, store = _encode(tmp_path, truth, mask=mask, nodata=0)
     da = store.to_xarray()
     assert "nodata" not in da.attrs
     assert da["mask"].dims == ("time", "y", "x")
@@ -409,7 +364,7 @@ def test_to_xarray_carries_validity_as_a_mask_coordinate_not_a_nodata_attr(tmp_p
 
 def test_to_xarray_without_a_mask_keeps_the_nodata_attr_and_has_no_mask(tmp_path):
     truth, _ = _zeros_that_are_valid()
-    _, store = _encode(tmp_path, truth, encoding="none")
+    _, store = _encode(tmp_path, truth)
     da = store.to_xarray()
     assert da.attrs["nodata"] == 0
     assert "mask" not in da.coords

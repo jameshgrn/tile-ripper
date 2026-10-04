@@ -4,7 +4,7 @@ import { BandwidthEstimator } from '../chronozarr/bandwidth.js';
 import { ChunkCache, SpeculativeBudget } from '../chronozarr/cache.js';
 import { RequestLimiter } from '../chronozarr/limiter.js';
 
-const meta = (t, extra = {}) => ({ kind: 'data', lod: 0, row: 0, col: 0, t, anchor: t % 2 === 0, ...extra });
+const meta = (t, extra = {}) => ({ kind: 'data', lod: 0, row: 0, col: 0, t, ...extra });
 const decoded = (n) => new Uint16Array(n / 2);
 const compressed = (n) => new Uint8Array(n);
 const farFrom = (center) => (entry) => Math.abs(entry.t - center);
@@ -24,7 +24,7 @@ test('an entry holds decoded data, compressed bytes, or both; each tier has its 
   assert.ok(c.decoded('a'));
   assert.equal(c.decoded('b'), undefined, 'a compressed-only chunk is not a decoded hit');
   assert.ok(c.get('b').compressed);
-  assert.deepEqual(c.info(), { entries: 1, anchors: 1, deltas: 0, bytes: 40, compressedEntries: 2, compressedBytes: 55 });
+  assert.deepEqual(c.info(), { entries: 1, bytes: 40, compressedEntries: 2, compressedBytes: 55 });
 });
 
 test('over the decoded budget the worst resident loses its array but keeps its compressed bytes', () => {

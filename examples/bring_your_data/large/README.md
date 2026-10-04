@@ -28,13 +28,12 @@ refer to complete prepared COG files; the remote full Sentinel-2 assets were not
 fully downloaded or hashed. This is an adoption exercise, not a validated scientific
 change-detection product.
 
-The validator deliberately chooses star-delta with anchor interval 6, rather than
-automatic encoding, to exercise anchors and deltas. It converts eleven dates and
+The v0.3 validator writes true values. It converts eleven dates and
 appends the actual December acquisition. It reconciles every level-0 value and mask
 locally and through HTTP, physical scaling and NaNs, unchanged existing chunks,
 and old local/HTTP handle snapshot behavior. The browser assembles complete
 level-0 frames from all nine cells and compares data/mask SHA256 to the Python COG
-goldens. This covers all bands, dates, anchors/deltas, padded edge cells and masked
+goldens. This covers all bands, dates, true values, padded edge cells and masked
 pixels, beyond a few inspector samples. It separately waits for completed viewer
 frames for all twelve dates; numeric raster hashes do not validate shader colours.
 
@@ -69,3 +68,5 @@ are not comparative performance measurements. The initial validation attempt
 finished its numeric assertions but failed at a cleanup call; its stores were
 preserved under `attempt1-*` locally and the recorded successful pass used freshly
 converted stores.
+
+The checked-in results describe the historical v0.2 run; regenerate them to obtain v0.3 evidence.

@@ -9,7 +9,6 @@
 //                   texture pool emptied so every switch uploads from the decoded cache.
 //   product switch  setProduct -> frame finished.
 //   decode          per-chunk zarrita decode time, replayed from recorded bytes (no network).
-//   cpu add         the JS star-delta loop the GPU path replaces, for reference.
 //
 // `await chronozarr.scrubBench()` measures what a user feels while stepping and dragging the time
 // slider; see runScrubBenchmarks. `await chronozarr.playBench({ stepsPerSecond: 4 })` plays one movie
@@ -18,7 +17,7 @@
 // per phase, for before/after comparisons; see interactionBench.
 
 import * as zarr from '../vendor/zarrita/index.js';
-import { applyDelta, openStore } from '../chronozarr/decoder.js';
+import { openStore } from '../chronozarr/decoder.js';
 import { FrameMonitor, analyzeLatency, emptyStats, formatPhaseTable, frameCompleteness, isWholeFrame, readStats, statsDelta } from './perf.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -183,14 +182,13 @@ async function decodeTimings(url, repeats) {
   const replayer = await openStore(url, { store: replayStore(records), workers: 0 });
   await replayer.getRaw(0, 0, 0, 0);
 
-  const anchors = [];
-  const deltas = [];
+  const chunks = [];
   for (let t = 0; t < timesteps; t++) {
     for (let i = 0; i < repeats; i++) {
       replayer.clearCache();
       const started = performance.now();
       await replayer.getRaw(0, 0, 0, t);
-      (replayer.isAnchor(t) ? anchors : deltas).push(performance.now() - started);
+      chunks.push(performance.now() - started);
     }
   }
   const level = replayer.levels[0];
@@ -211,22 +209,7 @@ async function decodeTimings(url, repeats) {
   pooled.close();
 
   const format = (values) => (values.length ? Object.fromEntries(Object.entries(summarize(values)).map(([k, v]) => [k, round(v)])) : null);
-  return { chunkRawBytes: level.chunkBytes, anchor: format(anchors), delta: format(deltas), parallel: { chunks: timesteps, mainThreadMs: round(mainThreadMs), workerPoolMs: round(poolMs) } };
-}
-
-async function cpuAddTimings(store, repeats) {
-  const nonAnchor = store.times.findIndex((_, t) => !store.isAnchor(t));
-  if (nonAnchor < 0) return null;
-  const anchor = await store.getRaw(0, 0, 0, store.anchorOf(nonAnchor));
-  const delta = await store.getRaw(0, 0, 0, nonAnchor);
-  const times = [];
-  for (let i = 0; i < repeats; i++) {
-    const started = performance.now();
-    applyDelta(anchor, delta);
-    times.push(performance.now() - started);
-  }
-  const perChunk = summarize(times).median;
-  return { msPerChunk: round(perChunk), cells: cellCount(store), msPerFrame: round(perChunk * cellCount(store)) };
+  return { chunkRawBytes: level.chunkBytes, chunk: format(chunks), parallel: { chunks: timesteps, mainThreadMs: round(mainThreadMs), workerPoolMs: round(poolMs) } };
 }
 
 const cellCount = (store) => store.levels[0].gridRows * store.levels[0].gridCols;
@@ -267,7 +250,6 @@ export async function runBenchmarks(viewer, { coldRuns = 5, switches = 30 } = {}
   );
 
   results.decodePerChunk = await decodeTimings(url, 10);
-  results.cpuStarDeltaAdd = await cpuAddTimings(viewer.store, 20);
 
   console.log(JSON.stringify(results, null, 2));
   window.__benchResults = results;

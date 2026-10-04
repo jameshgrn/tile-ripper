@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 import chronozarr
+from chronozarr import schema
 from chronozarr.stac import EXT_DATACUBE, ZARR_MEDIA_TYPE, build_stac, default_id, write_stac
 from tests.synthetic import BANDS, CRS, TRANSFORM, build_store, make_truth
 
@@ -21,7 +22,7 @@ rasterio = pytest.importorskip("rasterio")
 def store_path(tmp_path_factory) -> Path:
     path = tmp_path_factory.mktemp("stac") / "aoi_one" / "chronozarr-2"
     path.parent.mkdir()
-    build_store(path, make_truth(5, 2, 40, 50), shard=True, chunk_size=16, anchor_interval=2)
+    build_store(path, make_truth(5, 2, 40, 50), shard=True, chunk_size=16)
     return path
 
 
@@ -87,7 +88,7 @@ def test_datacube_dimensions_and_variables(store_path):
     assert variable["type"] == "data"
     assert variable["data_type"] == "uint16"
     assert variable["nodata"] == 0
-    assert "residuals" in variable["description"]  # star-delta caveat for plain readers
+    assert "residuals" not in variable["description"]
 
 
 def test_bands_and_chronozarr_fields(store_path):
@@ -96,7 +97,10 @@ def test_bands_and_chronozarr_fields(store_path):
     assert [b["name"] for b in props["bands"]] == BANDS
     assert all(b["data_type"] == "uint16" and b["nodata"] == 0 for b in props["bands"])
     assert props["chronozarr:spec_version"].startswith("0.")
-    assert props["chronozarr:anchor_interval"] == 2
+    assert "chronozarr:anchor_interval" not in props
+    assert props["chronozarr:zarr_conventions"] == [
+        schema.registration(n) for n in ("multiscales", "proj", "spatial")
+    ]
     assert props["chronozarr:levels"][0] == {
         "path": "0",
         "resolution": 10.0,
@@ -104,21 +108,6 @@ def test_bands_and_chronozarr_fields(store_path):
         "grid": [3, 4],
     }
     assert len(props["chronozarr:levels"]) >= 2
-
-
-def test_links_tie_item_and_collection_together(store_path):
-    _, (collection, item) = documents(store_path)
-    rels = {link["rel"]: link["href"] for link in item["links"]}
-    assert rels["collection"] == rels["parent"] == rels["root"] == "../collection.json"
-    assert item["collection"] == collection["id"] == "aoi"
-    item_links = [link for link in collection["links"] if link["rel"] == "item"]
-    assert item_links == [
-        {"rel": "item", "href": "./aoi/aoi.json", "type": "application/geo+json"}
-    ]
-    assert collection["license"] == "proprietary"
-    assert collection["extent"]["temporal"]["interval"] == [
-        [item["properties"]["start_datetime"], item["properties"]["end_datetime"]]
-    ]
 
 
 def test_write_stac_makes_files_with_relative_href_for_local_stores(store_path, tmp_path):

@@ -2,7 +2,7 @@
 
 chronozarr is a layout convention plus readers. Every object is an ordinary Zarr
 v3 object; the convention specifies a time axis, a multiscale pyramid, coordinates,
-and optional temporal encoding.
+and true stored values. The v0.3 profile uses zarr-conventions multiscales, proj and spatial v0.1; volatility is optional.
 
 ## A pyramid of arrays
 
@@ -28,11 +28,7 @@ Sharding is an option when reducing object count is useful, with byte-range read
 and index caching as the tradeoff. Growing stores generally favor unsharded output:
 new timesteps add objects rather than rewriting a trailing shard.
 
-With temporal encoding `none`, every chunk holds true values. With `star-delta`,
-anchor timesteps hold true unsigned integer values and other timesteps hold residuals
-against a recorded anchor. Decoding needs at most two data chunks, without reading
-all preceding timesteps. The writer default `auto` enables it only when sampled
-compressed size is at most 85% of plain storage. Signed and float data use `none`.
+Every timestep contains true stored values. Reading one timestep of a cell needs one data chunk. v0.2 stores require explicit migration: `chronozarr convert OLD_STORE NEW_STORE`.
 
 ## Values and validity
 
@@ -40,9 +36,7 @@ The format supports uint8, uint16, int16, and float32. Scale and offset describe
 physical values; a validity mask can distinguish valid zero from missing data.
 Coverage records how much input was observed, separately from validity.
 
-Compatible ordinary Zarr clients read the layout. They see true values when encoding
-is `none`, and residuals at non-anchor timesteps when encoding is `star-delta`.
-Use a chronozarr reader or export reconstructed COGs for the latter.
+Compatible ordinary Zarr clients read true stored values. Physical units still require scale and offset.
 
 See the [draft specification](/specification) for the normative requirements and
 [format comparison](/guides/format-comparison) for alternatives.

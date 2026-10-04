@@ -1,7 +1,7 @@
 // GLSL for the MapLibre layer.
 //
 // Vertex: an origin-translated matrix (composed in float64 on the CPU) times a small mercator offset.
-// Fragment: star-delta reconstruction (modular, spec v0.2) and the stored-to-physical conversion straight from the
+// Fragment: stored-to-physical conversion straight from the
 // raw texture array, whatever the store's dtype; the product colors are PRODUCT_GLSL, shared with the viewer.
 // Differences from js/demo/renderer.js: no background fill (no data is transparent so the basemap shows
 // through), an optional validity mask, and opacity.
@@ -19,27 +19,16 @@ void main() {
   v_texel = a_texel;
 }`;
 
-/** The value of (texel, band) of the timestep on screen: the stored number, reconstructed from anchor + residual for star-delta. */
-function valueGlsl({ delta }) {
-  if (delta === null) {
-    return `
-float value(ivec2 texel, int band) {
-  if (band < 0) return 0.0;
-  return float(texelFetch(u_data, ivec3(texel, u_anchorBase + band), 0).r);
-}`;
-  }
+/** The true stored value of (texel, band) of the timestep on screen. */
+function valueGlsl() {
   return `
-// star-delta: value = (anchor + residual) mod 2^bits
 float value(ivec2 texel, int band) {
   if (band < 0) return 0.0;
-  uint a = texelFetch(u_data, ivec3(texel, u_anchorBase + band), 0).r;
-  if (u_deltaBase < 0) return float(a);
-  uint d = texelFetch(u_data, ivec3(texel, u_deltaBase + band), 0).r;
-  return float((a + d) & ${delta}u);
+  return float(texelFetch(u_data, ivec3(texel, u_dataBase + band), 0).r);
 }`;
 }
 
-/** Fragment shader for a store: `dtype` picks the sampler and the reconstruction; `hasMask` adds the validity mask texture. */
+/** Fragment shader for a store: `dtype` picks the sampler; `hasMask` adds the validity mask texture. */
 export function fragmentShader({ dtype, hasMask }) {
   const format = TEXTURE_FORMATS[dtype];
   if (!format) throw new Error(`chronozarr maplibre: no shader for data type ${dtype}; supported: ${Object.keys(TEXTURE_FORMATS).join(', ')}`);
@@ -52,8 +41,7 @@ in vec2 v_texel;
 uniform ${format.sampler} u_data;
 ${hasMask ? 'uniform usampler2DArray u_mask;   // validity mask, one layer per slot: 1 = valid' : ''}
 uniform vec2 u_extent;      // valid texels in the chunk
-uniform int u_anchorBase;   // first layer of the anchor slot
-uniform int u_deltaBase;    // first layer of the delta slot; -1 when the timestep is itself an anchor
+uniform int u_dataBase;     // first layer of the true-value data slot
 uniform int u_maskLayer;    // layer of the mask slot (only read when the store has a mask)
 uniform ivec3 u_inputs;     // band index per product input, -1 = unused
 uniform int u_product;
@@ -67,7 +55,7 @@ uniform vec3 u_divisor;     // ... or stored / divisor + offset where the diviso
 uniform vec3 u_offset;
 uniform float u_opacity;
 out vec4 outColor;
-${valueGlsl(format)}
+${valueGlsl()}
 
 bool isNodata(float v) {
   return (u_hasNodata != 0 && v == u_nodata)${dtype === 'float32' ? ' || isnan(v)' : ''};

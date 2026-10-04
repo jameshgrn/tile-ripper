@@ -1,4 +1,4 @@
-"""chronozarr: Zarr v3 convention and reader for raster time series (optional star-delta)."""
+"""chronozarr: Zarr v3 convention and reader for raster time series (true-value v0.3)."""
 
 from chronozarr.append import AppendReport, append
 from chronozarr.decode import ChronoStore, HttpStore, open_store

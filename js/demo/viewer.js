@@ -521,7 +521,7 @@ class Viewer {
     const first = store.levels[0];
     renderer.configure({ dtype: this.dtype, nBand: first.nBand, chunkWidth: first.chunkWidth, chunkHeight: first.chunkHeight, slots: Math.max(4, 2 * cells.length + 4), hasMask: store.hasMask });
     const camera = { ...this.camera, scale: this.camera.scale * scale };
-    const chunksFor = (t) => cells.flatMap(([row, col]) => [...new Set([store.anchorOf(t), t])].map((ct) => [row, col, ct]));
+    const chunksFor = (t) => cells.flatMap(([row, col]) => [t].map((ct) => [row, col, ct]));
     const masksReady = (t) => !store.hasMask || cells.every(([row, col]) => store.peekMask(lod, row, col, t));
     return {
       canvas,
@@ -769,10 +769,10 @@ class Viewer {
     return this.#shown ? { lod: this.#shown.lod, t: this.#shown.t, kind: this.#shown.kind } : null;
   }
 
-  /** Whether the chunks of timestep t (anchor, delta and validity mask) of one cell are in memory, decoded or already on the GPU. */
+  /** Whether the chunks of timestep t (data and validity mask) of one cell are in memory, decoded or already on the GPU. */
   #cellReady(lod, row, col, t) {
     const { store, renderer } = this;
-    for (const ct of new Set([store.anchorOf(t), t])) {
+    for (const ct of [t]) {
       if (!renderer.isResident(chunkKey(lod, row, col, ct)) && !store.peekRaw(lod, row, col, ct)) return false;
     }
     if (store.hasMask) {
@@ -945,10 +945,9 @@ class Viewer {
 
   /** The chunks of timestep t of every visible cell of a level, with their masks, at demand priority. */
   #loadTimestep(lod, t, signal) {
-    const anchorT = this.store.anchorOf(t);
     return Promise.all(
       this.#visibleCells(lod).map(([row, col]) =>
-        Promise.all([this.store.getRaw(lod, row, col, anchorT, { signal }), anchorT === t ? null : this.store.getRaw(lod, row, col, t, { signal }), this.#maskRead(lod, row, col, t, signal)]),
+        Promise.all([this.store.getRaw(lod, row, col, t, { signal }), this.#maskRead(lod, row, col, t, signal)]),
       ),
     );
   }
@@ -1116,22 +1115,13 @@ class Viewer {
   }
 
   /**
-   * GPU slots for the anchor (and delta) chunk of a cell at t, uploading from the decoded cache if needed, or null
-   * while something is missing. With a validity mask the result also has `mask`, the slot holding the mask of t (the
-   * delta slot, or the anchor slot for an anchor) with that mask uploaded; -1 without one.
+   * GPU slots for the true-value chunk and its optional validity mask, or null while anything is missing.
    */
   #slotsFor(lod, row, col, t, renderer = this.renderer) {
-    const anchorT = this.store.anchorOf(t);
-    const anchor = this.#slotForChunk(lod, row, col, anchorT, renderer);
-    if (anchor < 0) return null;
-    let delta = -1;
-    if (anchorT !== t) {
-      delta = this.#slotForChunk(lod, row, col, t, renderer);
-      if (delta < 0) return null;
-    }
-    if (!this.store.hasMask) return { anchor, delta, mask: -1 };
-    const mask = delta >= 0 ? delta : anchor;
-    return this.#uploadMask(lod, row, col, t, mask, renderer) ? { anchor, delta, mask } : null;
+    const data = this.#slotForChunk(lod, row, col, t, renderer);
+    if (data < 0) return null;
+    if (!this.store.hasMask) return { data, mask: -1 };
+    return this.#uploadMask(lod, row, col, t, data, renderer) ? { data, mask: data } : null;
   }
 
   /** Whether slot `slot` holds the mask of timestep t of a cell, uploading it from the cache if it is not there yet. */
@@ -1170,14 +1160,13 @@ class Viewer {
     const { lod, cells } = this.#view;
     const { store, renderer, t } = this;
     if (cells.size === 0) return;
-    const anchorShare = store.anchorIndices.length / store.times.length;
-    const steps = Math.max(1, Math.floor((renderer.slots * GPU_FILL_FRACTION) / (cells.size * (1 + anchorShare))));
+    const steps = Math.max(1, Math.floor((renderer.slots * GPU_FILL_FRACTION) / (cells.size)));
     const timesteps = windowOrder(store.times.length, t, { direction: this.#direction, behindFactor: this.#behindFactor, loop: this.#playing }).slice(0, steps);
     const frameMs = this.#playback?.frameMs ?? 1000 / 60;
     const sliceMs = Math.min(GPU_UPLOAD_SLICE_MS, frameMs * GPU_SLICE_FRACTION_OF_FRAME);
     const started = performance.now();
     for (const tt of timesteps) {
-      for (const ct of new Set([store.anchorOf(tt), tt])) {
+      for (const ct of [tt]) {
         for (const key of cells) {
           const [row, col] = key.split('/').map(Number);
           const chunk = chunkKey(lod, row, col, ct);
@@ -1206,11 +1195,11 @@ class Viewer {
     const visible = meta.lod === this.#view.lod && this.#view.cells.has(cell);
     // The frame on screen may be a coarser level or an earlier timestep than the view asks for; it must stay drawable.
     const shown = this.#shown;
-    const onScreen = shown !== null && meta.lod === shown.lod && shown.cells.has(cell) && (meta.t === shown.t || meta.t === this.store.anchorOf(shown.t));
+    const onScreen = shown !== null && meta.lod === shown.lod && shown.cells.has(cell) && meta.t === shown.t;
     // The coarse loop is what a frame falls back to whatever the timestep: it stays ahead of everything else that is not on screen.
     const rank = visible || onScreen ? 0 : meta.lod === this.#coarseLoopLod ? COARSE_LOOP_RANK : 1e6;
     const cost = scrubCost(meta.t - this.t, this.#direction, this.#behindFactor, this.#playing ? this.store.times.length : null);
-    return rank + (this.store.isAnchor(meta.t) ? cost / 2 : cost);
+    return rank + cost;
   }
 
   /**
@@ -1230,8 +1219,7 @@ class Viewer {
     renderer.drawCell(
       { x: col * level.chunkWidth * factor, y: row * level.chunkHeight * factor, w: width * factor, h: height * factor },
       { w: width, h: height },
-      slots.anchor,
-      slots.delta,
+      slots.data,
       slots.mask,
     );
   }
@@ -1396,12 +1384,12 @@ class Viewer {
     return levels.map((level) => ({ lod: level, cells: ancestorCells(cells, lod, level) }));
   }
 
-  /** Decoded bytes of the valid pixels of the chunks of timestep t (its anchor and, unless it is one, its delta) that these cells of one level do not have in memory yet. */
+  /** Decoded bytes of the valid pixels of the chunks of timestep t  that these cells of one level do not have in memory yet. */
   #frameBytes(lod, cells, t) {
     const { store } = this;
     const level = store.levels[lod];
     const bytesPerPixel = level.chunkBytes / (level.chunkWidth * level.chunkHeight);
-    const chunks = [...new Set([store.anchorOf(t), t])];
+    const chunks = [t];
     let pixels = 0;
     for (const [row, col] of cells) {
       const { width, height } = store.cellExtent(lod, row, col);
@@ -1419,10 +1407,9 @@ class Viewer {
   #loadCells(wave, wanted) {
     const { lod, t } = wave;
     const { signal } = wave.controller;
-    const anchorT = this.store.anchorOf(t);
     let done = 0;
     for (const [row, col] of wanted) {
-      Promise.all([this.store.getRaw(lod, row, col, anchorT, { signal }), anchorT === t ? null : this.store.getRaw(lod, row, col, t, { signal }), this.#maskRead(lod, row, col, t, signal)]).then(
+      Promise.all([this.store.getRaw(lod, row, col, t, { signal }), this.#maskRead(lod, row, col, t, signal)]).then(
         () => {
           if (signal.aborted) return;
           this.#setProgress((++done / wanted.length) * 0.98);
@@ -1547,12 +1534,11 @@ class Viewer {
     const row = Math.floor(y / level.chunkHeight);
     const col = Math.floor(x / level.chunkWidth);
     const { t } = frame;
-    const anchorT = this.store.anchorOf(t);
     const cellX = x - col * level.chunkWidth;
     const cellY = y - row * level.chunkHeight;
     let mask = null;
     try {
-      [, , mask] = await Promise.all([this.store.getRaw(lod, row, col, anchorT), anchorT === t ? null : this.store.getRaw(lod, row, col, t), this.#maskRead(lod, row, col, t)]);
+      [, mask] = await Promise.all([this.store.getRaw(lod, row, col, t), this.#maskRead(lod, row, col, t)]);
     } catch (error) {
       this.#showError('Chunk load failed', error.message, { code: 'chunk_load_failed' });
       return;
@@ -1615,16 +1601,15 @@ class Viewer {
     const { store } = this;
     const { lod, row, col } = chart.cell;
     const level = store.levels[lod];
-    const sample = (anchor, delta, mask) => ({
-      pixels: chart.window.map(([x, y]) => samplePixelFrom(anchor, delta, level, x, y)),
+    const sample = (data, mask) => ({
+      pixels: chart.window.map(([x, y]) => samplePixelFrom(data, level, x, y)),
       ...(mask ? { valid: validAt(mask, level.chunkWidth, chart.window) } : {}),
     });
     const coverageOffset = chart.pixel.y * level.chunkWidth + chart.pixel.x;
     for (let t = 0; t < chart.readings.length; t++) {
-      const anchor = store.peekRaw(lod, row, col, store.anchorOf(t));
-      const delta = store.isAnchor(t) ? null : store.peekRaw(lod, row, col, t);
+      const data = store.peekRaw(lod, row, col, t);
       const mask = store.hasMask ? store.peekMask(lod, row, col, t) : null;
-      if (anchor && (store.isAnchor(t) || delta) && (!store.hasMask || mask)) chart.readings[t] = sample(anchor, delta, mask);
+      if (data && (!store.hasMask || mask)) chart.readings[t] = sample(data, mask);
       if (chart.coverage) {
         const coverage = store.peekCoverage(lod, row, col, t);
         if (coverage) chart.coverage[t] = coverage[coverageOffset];
@@ -1639,16 +1624,14 @@ class Viewer {
     for (let i = 0; i < missing.length; i += CHART_BATCH) {
       await Promise.all(
         missing.slice(i, i + CHART_BATCH).map(async (t) => {
-          const anchorT = store.anchorOf(t);
           const observed = chart.coverage && chart.coverage[t] === undefined ? this.#loadChartCoverage(chart, t, coverageOffset) : null;
           if (!chart.readings[t]) {
             try {
-              const [anchor, delta, mask] = await Promise.all([
-                store.getRaw(lod, row, col, anchorT, { signal }),
-                anchorT === t ? null : store.getRaw(lod, row, col, t, { signal }),
+              const [data, mask] = await Promise.all([
+                store.getRaw(lod, row, col, t, { signal }),
                 this.#maskRead(lod, row, col, t, signal),
               ]);
-              chart.readings[t] = sample(anchor, delta, mask);
+              chart.readings[t] = sample(data, mask);
             } catch (error) {
               if (error.name === 'AbortError') return;
               chart.failed++;

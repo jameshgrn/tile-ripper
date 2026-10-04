@@ -9,7 +9,7 @@
 //
 // `npm test` runs it first (the pretest script). The tests hard-code data/spike, so the directory cannot be a temp one.
 
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,8 +33,8 @@ const COMPRESSORS = {
   },
 };
 
-// 3 timesteps (anchors 0 and 2) x 2 bands x 700 x 600 pixels in 512 chunks, two levels: the shape of the original fixtures.
-const SYNTHETIC = { nTime: 3, nBand: 2, height: 700, width: 600, chunk: 512, anchorInterval: 2, nLevels: 2, bands: ['B04', 'B08'], consolidated: true, transform: [10, 0, 746090, 0, -10, 2540440] };
+// 3 true-value timesteps x 2 bands x 700 x 600 pixels in 512 chunks, two levels: the shape of the original fixtures.
+const SYNTHETIC = { nTime: 3, nBand: 2, height: 700, width: 600, chunk: 512, nLevels: 2, bands: ['B04', 'B08'], consolidated: true, transform: [10, 0, 746090, 0, -10, 2540440] };
 
 /** The shard with every inner chunk compressed and the index (at the end, with its crc32c) rewritten for the new sizes. */
 function repackShard(shard, nTime, compress) {
@@ -119,7 +119,7 @@ function syntheticFixtures() {
 /**
  * codec_bench: four chunks of 4 bands x 512 x 512 uint16 as arrays with three codec chains (plain, zstd level 5,
  * blosc zstd with byte shuffle), the layout of js/support/codec-bench/make_stores.py. Chunks 0-2 are smooth values with
- * noise, chunk 3 is signed residuals stored as unsigned bits, as a star-delta delta chunk is.
+ * noise; chunk 3 contains signed test patterns stored as unsigned bits for codec coverage.
  */
 async function codecBenchFiles() {
   const side = 512;
@@ -130,7 +130,7 @@ async function codecBenchFiles() {
     for (let b = 0; b < 4; b++) {
       for (let y = 0; y < side; y++) {
         for (let x = 0; x < side; x++) {
-          values[(b * side + y) * side + x] = c < 3 ? 800 + 300 * b + ((x * 5 + y * 3 + 977 * c) % 1400) + noise() : new Uint16Array(Int16Array.of(noise() - 32).buffer)[0];
+          values[(b * side + y) * side + x] = c < 3 ? 800 + 300 * b + ((x * 5 + y * 3 + 977 * c) % 1400) + noise() : noise();
         }
       }
     }
@@ -186,8 +186,12 @@ export async function makeNodeFixtures(root = DEFAULT_ROOT) {
   for (const [name, build] of Object.entries(builders)) {
     const dir = path.join(root, name);
     if (existsSync(dir)) {
-      result[name] = 'kept';
-      continue;
+      const version = name.startsWith('synthetic_') ? JSON.parse(await readFile(path.join(dir, 'zarr.json'), 'utf8')).attributes?.chronozarr?.spec_version : '0.3.0';
+      if (version === '0.3.0') {
+        result[name] = 'kept';
+        continue;
+      }
+      await rename(dir, `${dir}.pre-v03-${Date.now()}`);
     }
     await writeTree(dir, await build());
     result[name] = 'written';

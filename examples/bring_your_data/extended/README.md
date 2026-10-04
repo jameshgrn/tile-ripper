@@ -1,5 +1,7 @@
 # Twelve real dates and append/reopen
 
+Historical v0.2 results and artifacts below are preserved as recorded. They do not describe v0.3 writer options; use explicit conversion before reading the stores with v0.3.
+
 This bounded extension uses twelve independently fetched Sentinel-2 L2A acquisitions near
 Lake Mead, one per month in 2020, on a common 227 × 186, four-band, 10 m EPSG:32611 grid.
 It uses the same catalog and raster preparation helpers as the original recipe. Acquisition

@@ -8,7 +8,7 @@ import { buildSyntheticStore, coverageValue, maskValue } from '../support/synthe
 import { buildSeries, gapFilledTimes, seriesSpecs, validAt, windowPixels } from '../demo/chart.js';
 import { describePixel, displayMode, inputConversion, nodataToCompare, normalizeBands, percentileRange, resolveProducts, toPhysical } from '../shared/products.js';
 
-const base = { nTime: 6, height: 40, width: 40, chunk: 32, anchorInterval: 3, sharded: true };
+const base = { nTime: 6, height: 40, width: 40, chunk: 32,  sharded: true };
 
 async function open(spec) {
   const store = await openStore('memory://store', { store: buildSyntheticStore(spec), workers: 0 });
@@ -24,7 +24,7 @@ test('an 8-bit RGB store: true color from the common names, shown as it is, valu
     dtype: 'uint8',
     encoding: 'none',
     nodata: null,
-    specVersion: '0.2.0',
+    specVersion: '0.3.0',
     values,
     bandObjects: [{ name: 'r', common_name: 'red', scale: 1 }, { name: 'g', common_name: 'green', scale: 1 }, { name: 'b', common_name: 'blue', scale: 1 }],
   });
@@ -52,7 +52,7 @@ test('a float32 single-band store: only the single band, with an adjustable line
     dtype: 'float32',
     encoding: 'none',
     nodata: null,
-    specVersion: '0.2.0',
+    specVersion: '0.3.0',
     values,
     bandObjects: [{ name: 'depth', scale: 2, offset: -1, units: 'm' }],
   });
@@ -71,9 +71,9 @@ test('a float32 single-band store: only the single band, with an adjustable line
   assert.equal(series.values[1], null, 'NaN is a gap');
 });
 
-test('a v0.1 store with band names: Sentinel-2 reflectance, all products, exactly the 1/10000 arithmetic of before', async () => {
+test('a v0.3 store with explicit reflectance scales supports every product', async () => {
   const { store, bands, products } = await open({ ...base, nBand: 4, bands: ['B02', 'B03', 'B04', 'B08'], values: (t, b, y, x) => 1000 + 100 * b + x + t });
-  assert.equal(store.attrs.spec_version, '0.1.0');
+  assert.equal(store.attrs.spec_version, '0.3.0');
   assert.ok(Object.values(products).every((p) => p.available));
   assert.deepEqual(products.true_color.indices, [2, 1, 0]);
   assert.deepEqual(products.ndvi.indices.slice(0, 2), [3, 2]);
@@ -91,7 +91,7 @@ test('band order and names come from the store: nir listed first, common names o
   const { bands, products } = await open({
     ...base,
     nBand: 4,
-    specVersion: '0.2.0',
+    specVersion: '0.3.0',
     bandObjects: [
       { name: 'swir_ish', common_name: 'nir', scale: 1e-4 },
       { name: 'B02', common_name: 'red', scale: 1e-4 },
@@ -109,7 +109,7 @@ test('coverage from the store marks the gap-filled timesteps of a charted pixel'
     ...base,
     nBand: 4,
     coverage: true,
-    specVersion: '0.2.0',
+    specVersion: '0.3.0',
     bandObjects: ['B02', 'B03', 'B04', 'B08'].map((name) => ({ name, scale: 1e-4 })),
     values: (t, b, y, x) => 1000 + 100 * b + t * 10 + x,
   });
@@ -118,8 +118,8 @@ test('coverage from the store marks the gap-filled timesteps of a charted pixel'
   const readings = [];
   const coverage = [];
   for (let t = 0; t < store.times.length; t++) {
-    const [anchor, delta] = await Promise.all([store.getRaw(0, 0, 0, store.anchorOf(t)), store.isAnchor(t) ? null : store.getRaw(0, 0, 0, t)]);
-    readings.push({ pixels: windowPixels(x, y, 40, 40, 0).map(([px, py]) => samplePixelFrom(anchor, delta, store.levels[0], px, py)) });
+    const data = await store.getRaw(0, 0, 0, t);
+    readings.push({ pixels: windowPixels(x, y, 40, 40, 0).map(([px, py]) => samplePixelFrom(data, store.levels[0], px, py)) });
     coverage.push((await store.getCoverage(0, 0, 0, t))[y * store.levels[0].chunkWidth + x]);
   }
   assert.deepEqual(coverage, Array.from({ length: 6 }, (_, t) => coverageValue(t, y, x)), 'the coverage chunk of each timestep, read at the pixel');
@@ -139,7 +139,7 @@ test('a masked store: the chart and the readout follow the mask chunk the reader
     nBand: 4,
     mask: true,
     nodata: 0,
-    specVersion: '0.2.0',
+    specVersion: '0.3.0',
     bandObjects: ['B02', 'B03', 'B04', 'B08'].map((name) => ({ name, scale: 1e-4 })),
     values,
   });
@@ -150,9 +150,9 @@ test('a masked store: the chart and the readout follow the mask chunk the reader
   const readings = [];
   const masks = [];
   for (let t = 0; t < store.times.length; t++) {
-    const [anchor, delta, mask] = await Promise.all([store.getRaw(0, 0, 0, store.anchorOf(t)), store.isAnchor(t) ? null : store.getRaw(0, 0, 0, t), store.getMask(0, 0, 0, t)]);
+    const [data, mask] = await Promise.all([store.getRaw(0, 0, 0, t), store.getMask(0, 0, 0, t)]);
     masks.push(mask[y * level.chunkWidth + x]);
-    readings.push({ pixels: window.map(([px, py]) => samplePixelFrom(anchor, delta, level, px, py)), valid: validAt(mask, level.chunkWidth, window) });
+    readings.push({ pixels: window.map(([px, py]) => samplePixelFrom(data, level, px, py)), valid: validAt(mask, level.chunkWidth, window) });
   }
   assert.deepEqual(masks, Array.from({ length: 6 }, (_, t) => maskValue(t, y, x)), 'the mask chunk of each timestep');
   assert.ok(masks.includes(0) && masks.includes(1), 'the fixture is masked at some timesteps and valid at others');

@@ -1,10 +1,8 @@
-// chronozarr reader (spec 0.1 and 0.2). No DOM. Runs in browsers (decode workers) and Node.
+// chronozarr reader (spec 0.3.x). No DOM. Runs in browsers (decode workers) and Node.
 //
 // Coordinates: (lod, row, col, t). One cell is one spatial chunk of one level; its stored bytes for a
 // timestep are one zarr inner chunk of shape (1, n_band, chunkH, chunkW), typed by the store's dtype
-// (uint8, uint16, int16 or float32). With temporal encoding "star-delta" anchors hold true values and every
-// other timestep holds a residual against `delta_reference[t]`, added back modulo 2^bits; with "none" every
-// timestep is stored as is.
+// (uint8, uint16, int16 or float32). Every timestep stores true values and needs one data chunk.
 //
 // Reading is done here rather than through zarrita's Array so that fetching and decoding are separate
 // steps: chunk bytes are fetched with one range request (shard index cached per shard, cancellable), then
@@ -16,8 +14,8 @@
 // request slots from demand reads. It is modest while the viewer is idle (a horizon of timesteps around t and a
 // byte cap per idle episode) and covers the whole axis only for playback.
 //
-// An open store is a snapshot of the root zarr.json it was opened with: `times`, the level shapes, the anchors and
-// the delta references never change afterwards. When the store grows (spec section 14, `chronozarr append`), every
+// An open store is a snapshot of the root zarr.json it was opened with: `times` and the level shapes
+// never change afterwards. When the store grows (`chronozarr append`), every
 // chunk the reader knows keeps decoding, but the new timesteps stay invisible until the store is opened again: a
 // reader does not extend its own `times`, so showing them is a reload (call openStore again). One thing does move
 // under a running reader: the trailing time shard of each cell is replaced by a longer object, so the length
@@ -30,7 +28,7 @@ import { BandwidthEstimator } from './bandwidth.js';
 import { ChunkCache, SpeculativeBudget } from './cache.js';
 import { FetchError, HttpStore, LimitedReadable, abortError, isAbort, sleep } from './http.js';
 import { RequestLimiter } from './limiter.js';
-import { DTYPES, decodeSpec, normalizeBands, parseRoot, parseStorage, requireStore } from './metadata.js';
+import { DTYPES, decodeSpec, normalizeBands, parseSpatial, parseRoot, parseStorage, requireStore } from './metadata.js';
 import { DecodePool, MainThreadDecoder, leaseDecodePool } from './pool.js';
 import { ShardIndexError, parseShardIndex, shardIndexRange } from './shard.js';
 import { registry } from '../vendor/zarrita/codecs.js';
@@ -129,27 +127,13 @@ export function windowOrder(nTime, t, { direction = 1, behindFactor = 2, loop = 
   return Array.from({ length: nTime }, (_, i) => i).sort((a, b) => cost(a) - cost(b) || Math.abs(a - t) - Math.abs(b - t));
 }
 
-/**
- * Stored values of one pixel, per band, from an anchor chunk and, for non-anchor timesteps, its residual chunk
- * (null for anchors): (anchor + residual) modulo 2^bits, the arithmetic of the typed array. (x, y) are offsets
- * inside the chunk. The result has the chunk's typed array type.
- */
-export function samplePixelFrom(anchor, delta, { nBand, chunkWidth, chunkHeight }, x, y) {
+/** Stored values of one pixel per band, sampled directly from a true-value chunk. */
+export function samplePixelFrom(data, { nBand, chunkWidth, chunkHeight }, x, y) {
   const plane = chunkHeight * chunkWidth;
   const offset = y * chunkWidth + x;
-  const values = new anchor.constructor(nBand);
-  for (let b = 0; b < nBand; b++) {
-    const a = anchor[b * plane + offset];
-    values[b] = delta ? a + delta[b * plane + offset] : a;
-  }
+  const values = new data.constructor(nBand);
+  for (let b = 0; b < nBand; b++) values[b] = data[b * plane + offset];
   return values;
-}
-
-/** decode = (anchor + residual) modulo 2^bits; both inputs are arrays of one unsigned type (uint8 or uint16) and equal length. */
-export function applyDelta(anchor, delta) {
-  const out = new anchor.constructor(anchor.length);
-  for (let i = 0; i < out.length; i++) out[i] = anchor[i] + delta[i];
-  return out;
 }
 
 function defaultWorkerCount() {
@@ -222,6 +206,7 @@ export async function openStore(baseUrl, options = {}) {
   requireStore(rootBytes, baseUrl, 'root zarr.json not found');
   const root = JSON.parse(new TextDecoder().decode(rootBytes));
   const { cz, datasets } = parseRoot(root, baseUrl);
+  normalizeBands(cz, baseUrl);
   const variable = cz.variable ?? 'data';
 
   // One GET for everything when the root carries consolidated metadata, else one GET per array.
@@ -235,12 +220,10 @@ export async function openStore(baseUrl, options = {}) {
   const auxName = (declared, fallback) => declared ?? (consolidated[`${datasets[0].path}/${fallback}`] ? fallback : null);
   const names = { data: variable, mask: auxName(cz.mask_variable, 'mask'), coverage: auxName(cz.coverage_variable, 'coverage') };
   const readArrays = (name) => Promise.all(datasets.map((ds) => readMeta(`${ds.path}/${name}`, { required: true })));
-  const [dataMetas, maskMetas, coverageMetas, levelGroup] = await Promise.all([
+  const [dataMetas, maskMetas, coverageMetas] = await Promise.all([
     readArrays(names.data),
     names.mask ? readArrays(names.mask) : null,
     names.coverage ? readArrays(names.coverage) : null,
-    // Level groups carry the affine `transform`; the `levels` mirror makes reading one unnecessary.
-    Array.isArray(cz.levels) ? null : readMeta(datasets[0].path, { required: false }),
   ]);
   if (options.signal?.aborted) throw abortError();
 
@@ -273,6 +256,19 @@ export async function openStore(baseUrl, options = {}) {
     idleMs: options.idleMs ?? DEFAULT_IDLE_MS,
   };
 
+  const geometry = dataMetas.map((meta, lod) => parseSpatial(meta, cz, lod, baseUrl));
+  const transform = geometry[0].transform;
+  for (let lod = 0; lod < geometry.length; lod++) {
+    const expected = [transform[0] * 2 ** lod, 0, transform[2], 0, transform[4] * 2 ** lod, transform[5]];
+    requireStore(JSON.stringify(geometry[lod].transform) === JSON.stringify(expected), baseUrl, `level ${lod} is not a factor-two north-up overview`);
+    const shape = dataMetas[lod].shape;
+    requireStore(shape[2] === Math.ceil(dataMetas[0].shape[2] / 2 ** lod) && shape[3] === Math.ceil(dataMetas[0].shape[3] / 2 ** lod), baseUrl, `level ${lod} shape does not match factor-two pyramid`);
+    for (const metas of [maskMetas, coverageMetas]) if (metas) {
+      const aux = parseSpatial(metas[lod], { ...cz, levels: undefined }, lod, baseUrl);
+      requireStore(JSON.stringify(aux.transform) === JSON.stringify(expected) && JSON.stringify(metas[lod].shape) === JSON.stringify([shape[0], shape[2], shape[3]]), baseUrl, `level ${lod} auxiliary geometry or shape disagrees with data`);
+    }
+  }
+
   const workers = options.workers ?? defaultWorkerCount();
   let decoder;
   if (workers > 0) {
@@ -291,7 +287,6 @@ export async function openStore(baseUrl, options = {}) {
   }
   for (const spec of Object.values(specs)) decoder.warm?.(spec);
 
-  const transform = Array.isArray(cz.levels) ? cz.levels[0]?.transform : levelGroup?.attributes?.transform;
   return new ChronoStore({
     url: baseUrl,
     cz,
@@ -319,8 +314,6 @@ export class ChronoStore {
   #storage;
   #specs;
   #names;
-  #anchors;
-  #deltaReference;
   #cache;
   #auxCache;
   #clock;
@@ -352,7 +345,7 @@ export class ChronoStore {
   #activity = { t: null, viewKey: null, activeUntil: -Infinity, idleSpent: 0 };
 
   /**
-   * Eviction order: called with {lod,row,col,t,anchor,used}; the highest score is evicted first, in both cache
+   * Eviction order: called with {lod,row,col,t,used}; the highest score is evicted first, in both cache
    * tiers. The default is least recently used. A viewer sets this to "farthest from what is on screen".
    */
   evictionScore = (entry) => -entry.used;
@@ -366,7 +359,6 @@ export class ChronoStore {
     this.crs = cz.crs;
     /** Affine [a, b, c, d, e, f] from level-0 pixel (col, row) to projected x, y; null if the store declares none. */
     this.transform = transform;
-    this.temporal = cz.temporal;
     this.#readable = readable;
     this.#decoder = decoder;
     this.#limiter = limiter;
@@ -386,19 +378,6 @@ export class ChronoStore {
     const { bands, bandNames } = normalizeBands(cz, url);
     this.bands = bandNames;
     const nTime = this.times.length;
-    const encoding = cz.temporal.encoding;
-    if (encoding === 'star-delta') {
-      requireStore(storage.data[0].dtype === 'uint8' || storage.data[0].dtype === 'uint16', url, `star-delta needs uint8 or uint16 data, got ${storage.data[0].dtype}`);
-      this.#anchors = new Set(cz.temporal.anchor_indices);
-      this.#deltaReference = new Map(Object.entries(cz.temporal.delta_reference).map(([t, a]) => [Number(t), a]));
-    } else {
-      this.#anchors = new Set(Array.from({ length: nTime }, (_, t) => t));
-      this.#deltaReference = new Map();
-    }
-    for (let t = 0; t < nTime; t++) {
-      requireStore(this.#anchors.has(t) || this.#deltaReference.has(t), url, `timestep ${t} is neither an anchor nor in delta_reference`);
-    }
-    this.encoding = encoding;
     this.dtype = storage.data[0].dtype;
     const bytesPerElement = DTYPES[this.dtype].bytes;
 
@@ -408,7 +387,10 @@ export class ChronoStore {
       requireStore(levelTime === nTime, url, `level ${lod} has ${levelTime} timesteps, times attr has ${nTime}`);
       requireStore(nBand === bands.length, url, `level ${lod} has ${nBand} bands, bands attr has ${bands.length}`);
       requireStore(chunkB === nBand, url, `level ${lod} chunks must hold all ${nBand} bands, got ${chunkB}`);
-      // `pixels_per_tile` is ignored whatever its value (spec 3.4): the cell size is the array's chunk shape.
+      requireStore(chunkHeight === chunkWidth && chunkHeight > 0 && chunkHeight % 2 === 0, url, `level ${lod} chunks must be square with a positive even size`);
+      requireStore(lod === 0 || chunkWidth === storage.data[0].innerShape[3], url, 'chunk size must be identical at every level');
+      const declaredGrid = levelMirror?.[lod]?.grid;
+      requireStore(!declaredGrid || JSON.stringify(declaredGrid) === JSON.stringify([Math.ceil(height / chunkHeight), Math.ceil(width / chunkWidth)]), url, `level ${lod} grid mirror disagrees with array`);
       for (const kind of ['mask', 'coverage']) {
         const aux = storage[kind]?.[lod];
         if (aux) requireStore(aux.innerShape[1] === chunkHeight && aux.innerShape[2] === chunkWidth, url, `level ${lod} ${names[kind]} chunks are ${aux.innerShape.slice(1)}, data chunks are ${chunkHeight}x${chunkWidth}`);
@@ -443,7 +425,6 @@ export class ChronoStore {
       band_names: bandNames,
       bandNames,
       nodata: this.nodata,
-      encoding,
       dtype: this.dtype,
       levels: this.levels.map((l) => ({ path: l.path, resolution: l.resolution, transform: l.transform, shape: [l.nTime, l.nBand, l.height, l.width], grid: [l.gridRows, l.gridCols] })),
       hasMask: this.hasMask,
@@ -452,7 +433,7 @@ export class ChronoStore {
     };
 
     this.#counters = {
-      cache: { hits: 0, misses: 0, joins: 0, anchorHits: 0, anchorMisses: 0, compressedHits: 0, speculativeBytes: 0 },
+      cache: { hits: 0, misses: 0, joins: 0, compressedHits: 0, speculativeBytes: 0 },
       loads: { count: 0, fetchMs: 0, decodeMs: 0 },
     };
     Object.defineProperty(network, 'inflight', { get: () => limiter.active, enumerable: true });
@@ -475,22 +456,6 @@ export class ChronoStore {
      * re-read because of the once-a-minute cap.
      */
     this.stats = Object.assign(snapshot, { network, cache: cacheStats, loads: this.#counters.loads, recoveries: this.#recoveries });
-  }
-
-  isAnchor(t) {
-    return this.#anchors.has(t);
-  }
-
-  /** The anchor timestep needed to decode t (t itself for anchors, and for every timestep under encoding "none"). */
-  anchorOf(t) {
-    if (this.#anchors.has(t)) return t;
-    const anchor = this.#deltaReference.get(t);
-    if (anchor === undefined) throw new RangeError(`timestep ${t} out of range 0..${this.times.length - 1}`);
-    return anchor;
-  }
-
-  get anchorIndices() {
-    return [...this.#anchors].sort((a, b) => a - b);
   }
 
   /** The most decoded bytes the cache can hold (what `loopFits` and the prefetch window are sized by). */
@@ -555,7 +520,7 @@ export class ChronoStore {
 
   resetStats() {
     const { cache, loads } = this.#counters;
-    for (const name of ['hits', 'misses', 'joins', 'anchorHits', 'anchorMisses', 'compressedHits', 'speculativeBytes']) cache[name] = 0;
+    for (const name of ['hits', 'misses', 'joins', 'compressedHits', 'speculativeBytes']) cache[name] = 0;
     Object.assign(loads, { count: 0, fetchMs: 0, decodeMs: 0 });
     Object.assign(this.#network, { requests: 0, bytes: 0, deduped: 0 });
     Object.assign(this.#recoveries, { rootRefetches: 0, retried: 0, suffixFallbacks: 0, suppressed: 0 });
@@ -586,7 +551,7 @@ export class ChronoStore {
     return this.#cache.info();
   }
 
-  /** Decoded raw chunk (anchor or every timestep under "none": true values; delta: residual) or undefined. Never fetches. */
+  /** Decoded true-value chunk or undefined. Never fetches. */
   peekRaw(lod, row, col, t) {
     return this.#cache.decoded(chunkKey(lod, row, col, t));
   }
@@ -607,26 +572,22 @@ export class ChronoStore {
       throw new RangeError(`timestep ${t} out of range 0..${level.nTime - 1}`);
     }
     const key = chunkKey(lod, row, col, t);
-    const anchor = this.isAnchor(t);
     const counters = this.#counters.cache;
     const decoded = this.#cache.decoded(key);
     if (decoded) {
       counters.hits++;
-      if (anchor) counters.anchorHits++;
       return decoded;
     }
-    const meta = { kind: 'data', lod, row, col, t, anchor };
+    const meta = { kind: 'data', lod, row, col, t };
     let entry = this.#inflight.get(key);
     if (entry && !entry.controller.signal.aborted) {
       this.#join(entry);
     } else if (this.#cache.get(key)?.compressed) {
       counters.hits++;
       counters.compressedHits++;
-      if (anchor) counters.anchorHits++;
       entry = this.#start(key, meta, { background: false });
     } else {
       counters.misses++;
-      if (anchor) counters.anchorMisses++;
       entry = this.#start(key, meta, { background: false });
     }
     const data = await this.#subscribe(entry, signal);
@@ -636,19 +597,15 @@ export class ChronoStore {
 
   /**
    * Decoded values for (lod,row,col,t) as `{ data, bands, chunkWidth, chunkHeight, width, height }`: `data` is a typed
-   * array [band][y][x] over the padded chunk (the cached array itself for anchors), `width` and `height` the valid
-   * (unpadded) extent of the cell. Fetches the anchor and delta chunks in parallel.
+   * array [band][y][x] over the padded chunk (the cached array itself), `width` and `height` the valid
+   * (unpadded) extent of the cell. Fetches one data chunk.
    */
   async getCell(lod, row, col, t) {
     const level = this.level(lod);
-    const anchorT = this.anchorOf(t);
-    const [anchor, delta] = await Promise.all([
-      this.getRaw(lod, row, col, anchorT),
-      anchorT === t ? null : this.getRaw(lod, row, col, t),
-    ]);
+    const data = await this.getRaw(lod, row, col, t);
     const { width, height } = this.cellExtent(lod, row, col);
     return {
-      data: delta ? applyDelta(anchor, delta) : anchor,
+      data,
       bands: level.nBand,
       chunkWidth: level.chunkWidth,
       chunkHeight: level.chunkHeight,
@@ -659,45 +616,38 @@ export class ChronoStore {
 
   /**
    * Decoded per-band values of one pixel from cached chunks only (no fetch, no whole-chunk pass).
-   * Returns null when the anchor or delta chunk is not cached. (x, y) are pixel offsets inside the cell.
+   * Returns null when the data chunk is not cached. (x, y) are pixel offsets inside the cell.
    */
   samplePixel(lod, row, col, t, x, y) {
     const level = this.level(lod);
-    const anchor = this.peekRaw(lod, row, col, this.anchorOf(t));
-    const delta = this.isAnchor(t) ? null : this.peekRaw(lod, row, col, t);
-    if (!anchor || (!this.isAnchor(t) && !delta)) return null;
-    return samplePixelFrom(anchor, delta, level, x, y);
+    const data = this.peekRaw(lod, row, col, t);
+    return data ? samplePixelFrom(data, level, x, y) : null;
   }
 
   /**
-   * The visible cells of one level for timestep `t`, at demand priority: resolves when the anchor and (if any)
-   * delta chunk of every cell are decoded, with `peekRaw` returning them (they are held in the cache until then).
+   * The visible cells of one level for timestep `t`, at demand priority: resolves when the data
+   * chunk of every cell is decoded, with `peekRaw` returning them (they are held in the cache until then).
    * Rejects when `signal` aborts or a chunk cannot be loaded. Meant for a coarse-first cold open: ask for the
    * deepest level's few cells, paint, then refine.
    *
    * @param {number} lod
    * @param {Array<[number, number]>} cells  [row, col] pairs, loaded in this order
    * @param {number} t
-   * @returns {Promise<{lod:number, t:number, anchorT:number, cells:Array<{row:number, col:number, anchor:ArrayBufferView, delta:ArrayBufferView|null}>}>}
+   * @returns {Promise<{lod:number, t:number, cells:Array<{row:number, col:number, data:ArrayBufferView}>}>}
    */
   async getCoarseFrame(lod, cells, t, { signal } = {}) {
     const level = this.level(lod);
     for (const [row, col] of cells) this.#checkCell(level, row, col);
-    const anchorT = this.anchorOf(t);
-    const wanted = [...new Set([anchorT, t])];
-    const keys = cells.flatMap(([row, col]) => wanted.map((ct) => chunkKey(lod, row, col, ct)));
+    const keys = cells.map(([row, col]) => chunkKey(lod, row, col, t));
     this.#cache.pin(keys);
     try {
       const loaded = await Promise.all(
         cells.map(async ([row, col]) => {
-          const [anchor, delta] = await Promise.all([
-            this.getRaw(lod, row, col, anchorT, { signal }),
-            anchorT === t ? null : this.getRaw(lod, row, col, t, { signal }),
-          ]);
-          return { row, col, anchor, delta };
+          const data = await this.getRaw(lod, row, col, t, { signal });
+          return { row, col, data };
         }),
       );
-      return { lod, t, anchorT, cells: loaded };
+      return { lod, t, cells: loaded };
     } finally {
       this.#cache.unpin(keys);
     }
@@ -729,14 +679,12 @@ export class ChronoStore {
 
   /**
    * Background fetch of a time window around t for the given cells at one level, nearest first
-   * (scrubCost order, so the scrub direction reaches further), pulling in a delta's anchor just before
-   * the delta itself. Chunks near t are decoded; chunks the decoded tier cannot hold are kept as compressed
+   * (scrubCost order, so the scrub direction reaches further). Chunks near t are decoded; chunks the decoded tier cannot hold are kept as compressed
    * bytes when the cache has room. A new chunk only displaces cached ones that score worse (see `evictionScore`).
    *
    * How far the window reaches depends on what the viewer is doing. While it plays (`playing`, or `loop`, which
    * plans a looping movie) the window is as wide as the cache allows for these cells: the whole time axis when it
-   * fits. Otherwise it stops at the horizon, `horizonSteps` timesteps either side of t (12 by default) and the
-   * anchors they need; when scrubbing it reaches further in the scrub direction within that. If nothing has
+   * fits. Otherwise it stops at the horizon, `horizonSteps` timesteps either side of t (12 by default); when scrubbing it reaches further in the scrub direction within that. If nothing has
    * moved t for `idleMs` (3 s), the viewer is idle, and prefetch also stops once it has started `idleBytes` (64 MiB)
    * of speculative traffic for this view and timestep; a scrub, playback or new view starts a new allowance. A
    * `seek` (the view just jumped) does not widen anything: it only cancels the other speculative requests.
@@ -744,7 +692,7 @@ export class ChronoStore {
    * Speculative traffic is metered: 16 MB may start at once, after that half the measured bandwidth. Prefetch
    * waits while any demand fetch is in flight and never takes the last request slots. A cell whose chunk
    * failed is left alone for PREFETCH_COOLDOWN_MS. Aborting `signal` cancels this job's fetches that nobody else
-   * waits for. With `seek`, the chunks of timestep `t` itself (its anchor and delta) are fetched at demand
+   * waits for. With `seek`, the chunks of timestep `t` itself (its data) are fetched at demand
    * priority outside the allowance before the rest of the window. Resolves with counts and per-chunk errors
    * (nothing is thrown or hidden); `budgetReached` says the cache or the idle allowance stopped it early.
    *
@@ -763,7 +711,7 @@ export class ChronoStore {
     const withMasks = masks && this.hasMask;
     this.#noteActivity({ lod, cells, t, wholeAxis });
     if (seek) this.#cancelSpeculative();
-    const targets = new Set([this.anchorOf(t), t]);
+    const targets = new Set([t]);
     const horizon = wholeAxis ? null : this.#policy.horizonSteps;
     const queue = this.#windowPlan(level, cells, t, { direction, behindFactor, loop }, horizon).map(([row, col, ct]) => ({ row, col, t: ct, free: seek && targets.has(ct) }));
     const result = { planned: queue.length, fetched: 0, skipped: 0, compressedOnly: 0, masks: 0, budgetReached: false, errors: [] };
@@ -791,7 +739,7 @@ export class ChronoStore {
           }
           if (!free) await this.#demandIdle(signal);
           if (signal?.aborted) return;
-          const meta = { kind: 'data', lod, row, col, t: tt, anchor: this.isAnchor(tt) };
+          const meta = { kind: 'data', lod, row, col, t: tt };
           if (!this.#canPlace(meta, level.chunkBytes)) {
             result.budgetReached = true;
             return;
@@ -842,7 +790,7 @@ export class ChronoStore {
   #prefetchMask(lod, row, col, t, owner) {
     const key = this.#auxKey('mask', lod, row, col, t);
     const level = this.levels[lod];
-    const meta = { kind: 'mask', lod, row, col, t, anchor: false };
+    const meta = { kind: 'mask', lod, row, col, t };
     if (this.#auxCache.has(key) || this.#inflight.has(key) || !this.#auxCache.canHoldDecoded(meta, level.chunkHeight * level.chunkWidth)) return null;
     return this.#start(key, meta, { background: true, owner: owner ?? true });
   }
@@ -888,7 +836,7 @@ export class ChronoStore {
     this.#activity.idleSpent = Math.max(0, this.#activity.idleSpent - bytes);
   }
 
-  /** Chunks [row, col, t] to prefetch, in fetch order; with a `horizon`, only timesteps within that many of t (and the anchors they need). */
+  /** Chunks [row, col, t] to prefetch, in fetch order; with a `horizon`, only timesteps within that many of t . */
   #windowPlan(level, cells, t, order, horizon) {
     const decodedChunks = this.#cache.decodedLimit / level.chunkBytes;
     const compressedChunks = this.#cache.compressedLimit / (level.chunkBytes * this.#compressionRatio);
@@ -897,16 +845,7 @@ export class ChronoStore {
     const capacity = this.#cache.compressedLimit > 0 ? Math.min(decodedChunks + compressedChunks, this.#cache.maxTotal / (level.chunkBytes * this.#compressionRatio)) : decodedChunks;
     const perCellLimit = Math.max(1, Math.floor((capacity * WINDOW_BUDGET_FRACTION) / Math.max(1, cells.length)));
     const timesteps = windowOrder(level.nTime, t, order).filter((tt) => horizon === null || Math.abs(tt - t) <= horizon);
-    const chosen = [];
-    const seen = new Set();
-    outer: for (const tt of timesteps) {
-      for (const ct of [this.anchorOf(tt), tt]) {
-        if (seen.has(ct)) continue;
-        if (seen.size >= perCellLimit) break outer;
-        seen.add(ct);
-        chosen.push(ct);
-      }
-    }
+    const chosen = timesteps.slice(0, perCellLimit);
     return chosen.flatMap((ct) => cells.map(([row, col]) => [row, col, ct]));
   }
 
@@ -960,7 +899,7 @@ export class ChronoStore {
     if (cached) return cached;
     let entry = this.#inflight.get(key);
     if (entry && !entry.controller.signal.aborted) this.#join(entry);
-    else entry = this.#start(key, { kind, lod, row, col, t, anchor: false }, { background: false });
+    else entry = this.#start(key, { kind, lod, row, col, t }, { background: false });
     return this.#subscribe(entry, signal);
   }
 
@@ -1065,9 +1004,9 @@ export class ChronoStore {
     this.#counters.loads.decodeMs += decodedAt - fetchedAt;
     this.probe?.({ type: 'chunk', key, t: meta.t, background: entry.background, requestedAt, fetchedAt, decodedAt, bytes: held ? 0 : (bytes?.length ?? 0), decoded: data !== null });
     if (kind === 'data') {
-      this.#cache.insert(key, { kind, lod, row: meta.row, col: meta.col, t: meta.t, anchor: meta.anchor }, { data, compressed: held ? null : retained }, { background: entry.background && entry.priority.value !== 0 });
+      this.#cache.insert(key, { kind, lod, row: meta.row, col: meta.col, t: meta.t }, { data, compressed: held ? null : retained }, { background: entry.background && entry.priority.value !== 0 });
     } else {
-      this.#auxCache.insert(key, { kind, lod, row: meta.row, col: meta.col, t: meta.t, anchor: false }, { data }, { background: entry.background && entry.priority.value !== 0 });
+      this.#auxCache.insert(key, { kind, lod, row: meta.row, col: meta.col, t: meta.t }, { data }, { background: entry.background && entry.priority.value !== 0 });
     }
     return data ?? undefined;
   }
